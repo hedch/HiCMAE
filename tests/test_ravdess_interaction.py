@@ -45,6 +45,30 @@ class DataTests(unittest.TestCase):
     def test_requested_class_order(self):
         self.assertEqual([EMOTION_CODES[x] for x in [3, 4, 5, 6, 8, 7]], list(range(6)))
 
+    def test_same_01_prefix_and_uppercase_extensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stem = '01-01-08-02-02-02-24'
+            (root / (stem + '.MP4')).touch()
+            (root / (stem + '.WAV')).touch()
+            rows = discover(root, root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['actor'], 24)
+            self.assertEqual(rows[0]['label'], 4)
+            self.assertEqual(Path(rows[0]['audio']).stem, stem)
+            # If an official audio-only copy also exists, choose it deterministically.
+            official = root / ('03' + stem[2:] + '.wav')
+            official.touch()
+            self.assertEqual(Path(discover(root, root)[0]['audio']), official)
+
+    def test_02_extracted_audio_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stem = '02-01-05-01-01-01-01'
+            (root / (stem + '.mp4')).touch()
+            (root / (stem + '.wav')).touch()
+            self.assertEqual(len(discover(root, root)), 1)
+
     def test_neutral_and_calm_excluded_from_targets(self):
         rows = self.rows + [dict(actor=a, label=c, video='control', audio='x')
                             for a in range(1, 25) for c in [-1, -2]]
