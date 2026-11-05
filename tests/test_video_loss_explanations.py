@@ -1,8 +1,26 @@
 import importlib.util
+import ast
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+
+class IndexRecordTests(unittest.TestCase):
+    def test_existing_condition_is_not_passed_twice(self):
+        # Execute the pure helper directly, without importing optional ML dependencies.
+        source = Path(__file__).resolve().parents[1] / 'video_loss_explanations.py'
+        tree = ast.parse(source.read_text())
+        helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'make_index_record')
+        namespace = {}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), 'exec'), namespace)
+        metadata = dict(condition='both', loss=.5, correct=True)
+        record = namespace['make_index_record'](metadata, 0, 'trial')
+        self.assertEqual(json.loads(json.dumps(record))['condition'], 'both')
+        self.assertEqual(record['trial_index'], 0)
+        self.assertEqual(record['directory'], 'trial')
+        self.assertEqual(metadata, dict(condition='both', loss=.5, correct=True))
 
 
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('torch', 'numpy', 'PIL')),
@@ -101,6 +119,9 @@ class AttributionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             rows = [dict(video='02-01-05-01-01-01-01.mp4', actor=1, label=2)]
             export_test_explanations(model, loaders, rows, conditions, 'cpu', directory)
+            index_path = Path(directory) / 'explanations' / 'index.jsonl'
+            entries = [json.loads(line) for line in index_path.read_text().splitlines()]
+            self.assertEqual([entry['condition'] for entry in entries], list(conditions))
             for condition in conditions:
                 folder = next((Path(directory) / 'explanations' / condition).iterdir())
                 self.assertEqual(len(list(folder.glob('*_masked.png'))), 4)
