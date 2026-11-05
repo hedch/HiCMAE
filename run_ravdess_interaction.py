@@ -7,10 +7,13 @@ import argparse
 import csv
 import json
 import random
-from collections import Counter
 from pathlib import Path
 
-EMOTIONS = ['neutral', 'calm', 'happy', 'sad', 'angry', 'fearful', 'disgust', 'surprised']
+EMOTIONS = ['happy', 'sad', 'angry', 'fearful', 'surprised', 'disgusted']
+# RAVDESS codes: 07=disgust, 08=surprised. Preserve the requested class order.
+EMOTION_CODES = {3: 0, 4: 1, 5: 2, 6: 3, 8: 4, 7: 5}
+NUM_CLASSES = len(EMOTIONS)
+TEST_CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 
 
 def discover(video_root, audio_root):
@@ -40,9 +43,11 @@ def discover(video_root, audio_root):
     rows = []
     for key, video in sorted(videos.items()):
         parts = video.stem.split('-')
-        label, actor = int(parts[2]) - 1, int(parts[6])
-        if not 0 <= label < 8 or not 1 <= actor <= 24:
+        code, actor = int(parts[2]), int(parts[6])
+        if not 1 <= code <= 8 or not 1 <= actor <= 24:
             raise ValueError(f'Invalid RAVDESS filename: {video}')
+        # Neutral is a stimulus control only; calm is excluded entirely later.
+        label = EMOTION_CODES.get(code, -1 if code == 1 else -2)
         rows.append(dict(video=str(video), audio=str(audios[key]), label=label, actor=actor))
     if not rows:
         raise ValueError('No paired RAVDESS speech MP4/WAV files found.')
@@ -64,7 +69,8 @@ def balanced_split(rows, seed, val_actors=None, test_actors=None):
         raise ValueError('Actor groups must be nonempty, present, and disjoint.')
     result, report = {}, {}
     for i, (name, group) in enumerate([('train', train), ('val', val), ('test', test)]):
-        buckets = [[r for r in rows if r['actor'] in group and r['label'] == c] for c in range(8)]
+        buckets = [[r for r in rows if r['actor'] in group and r['label'] == c]
+                   for c in range(NUM_CLASSES)]
         n = min(map(len, buckets))
         if n == 0:
             raise ValueError(f'{name}: at least one emotion is absent.')
@@ -75,8 +81,36 @@ def balanced_split(rows, seed, val_actors=None, test_actors=None):
         rng.shuffle(selected)
         result[name] = selected
         report[name] = dict(actors=sorted(group), original_counts=[len(b) for b in buckets],
-                            balanced_counts=[n] * 8, total=8 * n)
+                            balanced_counts=[n] * NUM_CLASSES, total=NUM_CLASSES * n)
     return result, report
+
+
+def attach_test_controls(splits, rows, seed):
+    """Use same-actor, same-statement/repetition neutral faces from test actors only."""
+    references = {}
+    for row in rows:
+        if row['label'] == -1:
+            parts = Path(row['video']).stem.split('-')
+            key = (row['actor'], parts[4], parts[5])
+            if key in references:
+                raise ValueError(f'Duplicate neutral reference: {key}')
+            references[key] = row['video']
+    for i, row in enumerate(splits['test']):
+        parts = Path(row['video']).stem.split('-')
+        key = (row['actor'], parts[4], parts[5])
+        if key not in references:
+            raise ValueError(f'Missing neutral speech video for test actor/statement/repetition {key}')
+        row['neutral_video'] = references[key]
+        row['noise_seed'] = seed + 100000 + i
+
+
+def white_noise(num_samples, seed, rms):
+    """Fixed-RMS Gaussian white noise generated in waveform space, not filterbank space."""
+    import torch
+    generator = torch.Generator().manual_seed(seed)
+    wave = torch.randn(1, num_samples, generator=generator)
+    wave = wave - wave.mean()
+    return wave * (rms / wave.square().mean().sqrt().clamp_min(1e-12))
 
 
 def make_model(args):
@@ -93,7 +127,7 @@ def make_model(args):
                 num_heads=args.embed_dim // 64, depth=args.depth,
                 img_size_audio=(256, 128), patch_size_audio=16,
                 embed_dim_audio=args.embed_dim, num_heads_audio=args.embed_dim // 64,
-                depth_audio=args.depth, fusion_depth=0, num_classes=8,
+                depth_audio=args.depth, fusion_depth=0, num_classes=NUM_CLASSES,
                 qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
                 all_frames=16, drop_path_rate=args.drop_path)
             # Register only encoders and layer pooling weights: no fusion module.
@@ -101,9 +135,9 @@ def make_model(args):
             self.encoder_audio = backbone.encoder_audio
             self.video_layer_weights = backbone.video_layer_weights
             self.audio_layer_weights = backbone.audio_layer_weights
-            self.wv = nn.Linear(args.embed_dim, 8, bias=False)
-            self.wa = nn.Linear(args.embed_dim, 8, bias=False)
-            self.wf = nn.Linear(args.embed_dim, 8, bias=False)
+            self.wv = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
+            self.wa = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
+            self.wf = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
 
         def forward(self, video, audio, return_terms=False):
             v = self.encoder(video).mean(dim=1)  # B,L,D
@@ -144,8 +178,8 @@ def make_loaders(splits, args):
     from torch.utils.data import Dataset, DataLoader
 
     class PairedDataset(Dataset):
-        def __init__(self, rows, training):
-            self.rows, self.training = rows, training
+        def __init__(self, rows, training, condition='both'):
+            self.rows, self.training, self.condition = rows, training, condition
 
         def __len__(self):
             return len(self.rows)
@@ -166,7 +200,13 @@ def make_loaders(splits, args):
             start = random.uniform(0, duration - span) if self.training else (duration - span) / 2
             times = start + np.arange(16) * span / 16
             indices = np.clip((times * fps).astype(int), 0, len(vr) - 1)
-            frames = torch.from_numpy(vr.get_batch(indices).asnumpy()).permute(0, 3, 1, 2).float() / 255
+            if self.condition == 'audio_neutral':
+                neutral = VideoReader(row['neutral_video'], ctx=cpu(0), num_threads=1)
+                # One neutral midpoint face repeated across 16 frames: no mouth-motion cue.
+                pixels = neutral.get_batch([len(neutral) // 2] * 16).asnumpy()
+            else:
+                pixels = vr.get_batch(indices).asnumpy()
+            frames = torch.from_numpy(pixels).permute(0, 3, 1, 2).float() / 255
             _, _, h, w = frames.shape
             side = min(h, w)
             frames = frames[:, :, (h-side)//2:(h+side)//2, (w-side)//2:(w+side)//2]
@@ -177,6 +217,8 @@ def make_loaders(splits, args):
             wave = waveform[:, int(start*16000):int((start+span)*16000)]
             wave = torch.nn.functional.pad(wave, (0, max(0, 40960-wave.shape[1])))[:, :40960]
             wave = wave - wave.mean()
+            if self.condition == 'video_noise':
+                wave = white_noise(40960, row['noise_seed'], args.noise_rms)
             fb = torchaudio.compliance.kaldi.fbank(
                 wave, htk_compat=True, sample_frequency=16000, use_energy=False,
                 window_type='hanning', num_mel_bins=128, dither=0.0, frame_shift=10)
@@ -185,10 +227,14 @@ def make_loaders(splits, args):
             return video, audio, row['label']
 
     # num_workers=0 default also supports Windows: nested Dataset is not spawn-picklable.
-    return {name: DataLoader(PairedDataset(rows, name == 'train'), batch_size=args.batch_size,
-                            shuffle=name == 'train', num_workers=0,
-                            pin_memory=args.device.startswith('cuda'), drop_last=False)
-            for name, rows in splits.items()}
+    def loader(rows, training=False, condition='both'):
+        return DataLoader(PairedDataset(rows, training, condition), batch_size=args.batch_size,
+                          shuffle=training, num_workers=0,
+                          pin_memory=args.device.startswith('cuda'), drop_last=False)
+    loaders = dict(train=loader(splits['train'], training=True), val=loader(splits['val']))
+    for condition in TEST_CONDITIONS:
+        loaders['test_' + condition] = loader(splits['test'], condition=condition)
+    return loaders
 
 
 def train(splits, args, output):
@@ -217,9 +263,9 @@ def train(splits, args, output):
                 predictions.extend(logits.argmax(1).cpu().tolist())
                 probabilities.extend(logits.softmax(1).cpu().tolist())
         metrics = dict(accuracy=accuracy_score(labels, predictions),
-                       uar=recall_score(labels, predictions, labels=list(range(8)), average='macro', zero_division=0),
-                       macro_f1=f1_score(labels, predictions, labels=list(range(8)), average='macro', zero_division=0),
-                       confusion_matrix=confusion_matrix(labels, predictions, labels=list(range(8))).tolist())
+                       uar=recall_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0),
+                       macro_f1=f1_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0),
+                       confusion_matrix=confusion_matrix(labels, predictions, labels=list(range(NUM_CLASSES))).tolist())
         return metrics, labels, predictions, probabilities
 
     best = -1.0
@@ -247,14 +293,19 @@ def train(splits, args, output):
                             emotions=EMOTIONS, val=metrics), output / 'best.pth')
     best_state = torch.load(output / 'best.pth', map_location=device)
     model.load_state_dict(best_state['model'])
-    metrics, labels, predictions, probabilities = evaluate(loaders['test'])
-    (output / 'test_metrics.json').write_text(json.dumps(metrics, indent=2))
-    with (output / 'test_predictions.csv').open('w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['video', 'actor', 'label', 'prediction'] + [f'p_{e}' for e in EMOTIONS])
-        for row, y, pred, prob in zip(splits['test'], labels, predictions, probabilities):
-            writer.writerow([row['video'], row['actor'], y, pred] + prob)
-    print('Best-validation checkpoint test results:', json.dumps(metrics))
+    summary = {}
+    for condition in TEST_CONDITIONS:
+        metrics, labels, predictions, probabilities = evaluate(loaders['test_' + condition])
+        summary[condition] = metrics
+        (output / f'test_metrics_{condition}.json').write_text(json.dumps(metrics, indent=2))
+        with (output / f'test_predictions_{condition}.csv').open('w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['video', 'actor', 'neutral_video', 'noise_seed', 'label', 'prediction']
+                            + [f'p_{e}' for e in EMOTIONS])
+            for row, y, pred, prob in zip(splits['test'], labels, predictions, probabilities):
+                writer.writerow([row['video'], row['actor'], row['neutral_video'], row['noise_seed'], y, pred] + prob)
+    (output / 'test_metrics.json').write_text(json.dumps(dict(emotions=EMOTIONS, conditions=summary), indent=2))
+    print('Best-validation checkpoint test results:', json.dumps(summary))
 
 
 def main():
@@ -274,22 +325,30 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--drop-path', type=float, default=.1)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--noise-rms', type=float, default=0.05,
+                        help='White-noise waveform RMS in video-only testing (default .05)')
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.depth < 1 or args.lr <= 0:
         parser.error('epochs, batch-size, depth and lr must be positive')
     if not args.prepare_only and not args.checkpoint:
         parser.error('--checkpoint is required for fine-tuning')
+    if not 0 < args.noise_rms <= 1:
+        parser.error('--noise-rms must be in (0, 1]')
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
         parser.error('Use a new/empty output directory to avoid overwriting an experiment')
-    splits, report = balanced_split(discover(args.video_root, args.audio_root), args.seed,
-                                    args.val_actors, args.test_actors)
+    rows = discover(args.video_root, args.audio_root)
+    splits, report = balanced_split(rows, args.seed, args.val_actors, args.test_actors)
+    attach_test_controls(splits, rows, args.seed)
     output.mkdir(parents=True, exist_ok=True)
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
     (output / 'split_report.json').write_text(json.dumps(dict(emotions=EMOTIONS, splits=report), indent=2))
     for name, rows in splits.items():
         with (output / f'{name}.csv').open('w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['video', 'audio', 'label', 'actor'])
+            fields = ['video', 'audio', 'label', 'actor']
+            if name == 'test':
+                fields += ['neutral_video', 'noise_seed']
+            writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
     print(json.dumps(report, indent=2))
