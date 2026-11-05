@@ -230,3 +230,10 @@ and saved trial selections, keeps training/test metrics untouched, and rebuilds
 The original media paths in the manifests must still exist. In PyCharm, set this
 module as the script path and put the options in Parameters. This mode does not
 apply the training runner's empty-output-directory restriction.
+
+
+## Colored overlays
+
+Every explanation now additionally saves `frame_XX_overlay.png`: a jet-style color heatmap blended over the actual input frame. Maximum opacity is 0.45, multiplied by normalized positive relevance, so zero-relevance regions show the unchanged original image and the face remains visible at high relevance. The same per-trial scale across conditions is used. `frame_XX_masked.png` remains available as the multiplicative black-background visualization. Rerun the explanation-only command to add overlays to an existing trained run; no retraining is needed.
+
+The current runner uses one seeded 16/4/4 actor split. It does not implement the original repository's cross-validation folds (the repository supplies six RAVDESS split folders). Results from this runner are single-split results, not fold averages.
