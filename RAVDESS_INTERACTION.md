@@ -213,3 +213,20 @@ six dependency-backed tests were skipped because PyTorch is unavailable. Python
 compilation passed. Real media decoding, full-model attribution, and fine-tuning
 have not been executed here; run these checks in the project environment before
 a full experiment.
+
+## Retry explanation export without retraining
+
+If training and final testing completed but explanation export was interrupted,
+update `video_loss_explanations.py` and run it directly, pointing to the EXISTING
+run output directory (containing config.json, best.pth, and the three manifests):
+
+```bash
+python video_loss_explanations.py --output-dir /path/to/existing/run --device cuda --explain-limit 2
+```
+
+Omit `--explain-limit 2` to export all test trials. This loads the best checkpoint
+and saved trial selections, keeps training/test metrics untouched, and rebuilds
+`explanations/index.jsonl` while overwriting the corresponding explanation files.
+The original media paths in the manifests must still exist. In PyCharm, set this
+module as the script path and put the options in Parameters. This mode does not
+apply the training runner's empty-output-directory restriction.
