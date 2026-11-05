@@ -19,6 +19,20 @@ def make_index_record(metadata, trial_index, directory):
     return record
 
 
+def color_overlay(images, masks, opacity=0.45):
+    """Jet-style heatmap blend; zero relevance leaves original pixels unchanged."""
+    images = np.asarray(images, dtype=np.float32)
+    masks = np.clip(np.asarray(masks, dtype=np.float32), 0, 1)
+    if not 0 <= opacity <= 1:
+        raise ValueError('Overlay opacity must be between 0 and 1')
+    # Blue -> cyan -> yellow -> red, without a plotting/OpenCV dependency.
+    color = np.stack([np.clip(1.5 - np.abs(4 * masks - center), 0, 1)
+                      for center in (3, 2, 1)], axis=-1)
+    alpha = (opacity * masks)[..., None]
+    blended = images * (1 - alpha) + color * alpha
+    return np.rint(np.clip(blended, 0, 1) * 255).astype(np.uint8)
+
+
 def query_relevance(q, k, v, gradient, chunk_size=64):
     """Sum_i,c grad[i,c] * value[j,c] * minmax_cosine(q_i,k_j), per head.
 
@@ -143,15 +157,18 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
             std = video.new_tensor([.229, .224, .225])[:, None, None, None]
             images = (video * std + mean).clamp(0, 1).permute(1, 2, 3, 0)
             masked = (images * masks[..., None] * 255).round().byte().numpy()
+            overlays = color_overlay(images.numpy(), masks.numpy())
             for frame, image in enumerate(masked):
                 Image.fromarray(image).save(destination / ('frame_%02d_masked.png' % frame))
+                Image.fromarray(overlays[frame]).save(destination / ('frame_%02d_overlay.png' % frame))
             np.savez_compressed(destination / 'heatmaps.npz', signed=signed.numpy(),
                                 signed_layers=layers.numpy(), positive=positive.numpy(),
                                 normalized=(positive / max(float(positive.max()), 1e-12)).numpy(),
                                 shared_scale_masks=masks.numpy())
             metadata.update(trial=trial, condition=condition, shared_positive_scale=scale,
                             attribution='pooled-query Grad-ECLIP adaptation; target=cross entropy',
-                            display='positive loss relevance; shared scale across conditions within trial')
+                            display='positive loss relevance; shared scale across conditions within trial',
+                            overlay='jet-style; alpha=0.45*normalized_relevance; zero leaves image unchanged')
             (destination / 'metadata.json').write_text(json.dumps(metadata, indent=2))
             with manifest.open('a') as f:
                 f.write(json.dumps(make_index_record(metadata, index, destination)) + '\n')
