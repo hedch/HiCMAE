@@ -13,6 +13,12 @@ import torch.nn.functional as F
 from PIL import Image
 
 
+def make_index_record(metadata, trial_index, directory):
+    record = dict(metadata)
+    record.update(trial_index=trial_index, directory=str(directory))
+    return record
+
+
 def query_relevance(q, k, v, gradient, chunk_size=64):
     """Sum_i,c grad[i,c] * value[j,c] * minmax_cosine(q_i,k_j), per head.
 
@@ -116,6 +122,8 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
     root.mkdir(parents=True, exist_ok=True)
     count = len(rows) if limit == 0 else min(limit, len(rows))
     manifest = root / 'index.jsonl'
+    # A retry rebuilds the index and overwrites the corresponding trial exports.
+    manifest.write_text('')
     for index in range(count):
         trial = rows[index]
         results = {}
@@ -146,6 +154,45 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
                             display='positive loss relevance; shared scale across conditions within trial')
             (destination / 'metadata.json').write_text(json.dumps(metadata, indent=2))
             with manifest.open('a') as f:
-                f.write(json.dumps(dict(trial_index=index, condition=condition,
-                                        directory=str(destination), **metadata)) + '\n')
+                f.write(json.dumps(make_index_record(metadata, index, destination)) + '\n')
         print('Saved explanations %d/%d' % (index+1, count), flush=True)
+
+
+def main():
+    """Retry explanations from saved run files without repeating training."""
+    import argparse
+    import csv
+    from types import SimpleNamespace
+    from run_ravdess_interaction import make_model, make_loaders, TEST_CONDITIONS
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument('--output-dir', required=True, help='Existing experiment output folder')
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--explain-limit', type=int, default=0)
+    options = parser.parse_args()
+    if options.explain_limit < 0:
+        parser.error('--explain-limit must be nonnegative')
+    output = Path(options.output_dir)
+    config = json.loads((output / 'config.json').read_text())
+    config.update(device=options.device, explain_limit=options.explain_limit)
+    args = SimpleNamespace(**config)
+    splits = {}
+    for name in ('train', 'val', 'test'):
+        with (output / (name + '.csv')).open(newline='') as f:
+            rows = list(csv.DictReader(f))
+        for row in rows:
+            for key in ('label', 'actor', 'noise_seed'):
+                if key in row and row[key] != '':
+                    row[key] = int(row[key])
+        splits[name] = rows
+    checkpoint = torch.load(output / 'best.pth', map_location='cpu')
+    model = make_model(args)
+    model.load_state_dict(checkpoint['model'], strict=True)
+    model.to(options.device).eval()
+    loaders = make_loaders(splits, args)
+    export_test_explanations(model, loaders, splits['test'], TEST_CONDITIONS,
+                             options.device, output, options.explain_limit)
+
+
+if __name__ == '__main__':
+    main()
