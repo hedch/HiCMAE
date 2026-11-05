@@ -19,15 +19,22 @@ TEST_CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 def discover(video_root, audio_root):
     """Pair speech MP4s with WAVs using the six non-modality filename fields."""
     audios = {}
-    for path in sorted(Path(audio_root).rglob('*.wav')):
+    audio_priority = {'03': 0, '01': 1, '02': 2}
+    for path in sorted(Path(audio_root).rglob('*')):
+        if not path.is_file() or path.suffix.lower() != '.wav':
+            continue
         parts = path.stem.split('-')
-        if len(parts) == 7 and parts[:2] == ['03', '01']:
+        if len(parts) == 7 and parts[0] in audio_priority and parts[1] == '01':
             key = '-'.join(parts[1:])
-            if key in audios:
+            if key in audios and audios[key].stem.split('-')[0] == parts[0]:
                 raise ValueError(f'Duplicate audio trial: {key}')
-            audios[key] = path.resolve()
+            # Official audio-only exports take priority when several versions exist.
+            if key not in audios or audio_priority[parts[0]] < audio_priority[audios[key].stem.split('-')[0]]:
+                audios[key] = path.resolve()
     videos = {}
-    for path in sorted(Path(video_root).rglob('*.mp4')):
+    for path in sorted(Path(video_root).rglob('*')):
+        if not path.is_file() or path.suffix.lower() != '.mp4':
+            continue
         parts = path.stem.split('-')
         if len(parts) != 7 or parts[0] not in ('01', '02') or parts[1] != '01':
             continue
