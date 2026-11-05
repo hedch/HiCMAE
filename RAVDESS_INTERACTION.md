@@ -55,7 +55,7 @@ audio/Actor_01/03-01-05-01-01-01-01.wav
 ```
 
 Both video-only (02) and full-AV (01) MP4 modalities are accepted; video-only is
-preferred if both exist. Audio-only (03) WAV files are paired by filename. Song
+preferred if both exist. WAV files with prefixes 03 (official audio-only), 01 (full-AV exports), or 02 (video-only-named exports) are paired using the remaining six filename fields. If multiple audio versions exist, preference is 03, then 01, then 02. File extensions are case-insensitive. Identically named 01-prefixed MP4/WAV pairs in flat folders are supported. Song
 files are excluded. All discovered speech videos, including neutral controls,
 currently require matching WAVs. Audio is resampled to 16 kHz internally.
 
