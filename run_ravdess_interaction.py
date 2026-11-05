@@ -224,7 +224,7 @@ def make_loaders(splits, args):
                 window_type='hanning', num_mel_bins=128, dither=0.0, frame_shift=10)
             fb = torch.nn.functional.pad(fb[:256], (0, 0, 0, max(0, 256-fb.shape[0])))
             audio = ((fb + 4.2677393) / (4.5689974 * 2)).unsqueeze(0)
-            return video, audio, row['label']
+            return video, audio, row['label'], index
 
     # num_workers=0 default also supports Windows: nested Dataset is not spawn-picklable.
     def loader(rows, training=False, condition='both'):
@@ -251,61 +251,101 @@ def train(splits, args, output):
     loaders = make_loaders(splits, args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = torch.nn.CrossEntropyLoss()
+    prediction_dir = output / 'epoch_predictions'
+    prediction_dir.mkdir()
 
-    def evaluate(loader):
-        model.eval()
-        labels, predictions, probabilities = [], [], []
-        with torch.no_grad():
-            for v, a, y in loader:
+    def run_pass(loader, training=False):
+        model.train(training)
+        labels, predictions, losses, records = [], [], [], []
+        with torch.set_grad_enabled(training):
+            for v, a, y, indices in loader:
+                target = y.to(device)
                 logits = model(v.to(device), a.to(device))
+                batch_losses = torch.nn.functional.cross_entropy(logits, target, reduction='none')
+                loss = batch_losses.mean()
+                if not torch.isfinite(loss):
+                    raise RuntimeError('Nonfinite loss')
+                if training:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                pred = logits.detach().argmax(1).cpu().tolist()
+                probs = logits.detach().softmax(1).cpu().tolist()
+                values = batch_losses.detach().cpu().tolist()
                 labels.extend(y.tolist())
-                predictions.extend(logits.argmax(1).cpu().tolist())
-                probabilities.extend(logits.softmax(1).cpu().tolist())
-        metrics = dict(accuracy=accuracy_score(labels, predictions),
-                       uar=recall_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0),
-                       macro_f1=f1_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0),
+                predictions.extend(pred)
+                losses.extend(values)
+                for index, label, prediction, value, probability in zip(indices.tolist(), y.tolist(), pred, values, probs):
+                    row = loader.dataset.rows[index]
+                    record = dict(video=row['video'], actor=row['actor'],
+                                  neutral_video=row.get('neutral_video', ''), noise_seed=row.get('noise_seed', ''),
+                                  label=label, prediction=prediction, correct=int(label == prediction), loss=value)
+                    record.update(zip(['p_' + e for e in EMOTIONS], probability))
+                    records.append(record)
+        metrics = dict(loss=float(np.mean(losses)), accuracy=float(accuracy_score(labels, predictions)),
+                       correct=sum(y == p for y, p in zip(labels, predictions)), total=len(labels),
+                       uar=float(recall_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0)),
+                       macro_f1=float(f1_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0)),
                        confusion_matrix=confusion_matrix(labels, predictions, labels=list(range(NUM_CLASSES))).tolist())
-        return metrics, labels, predictions, probabilities
+        return metrics, records
+
+    def save_predictions(path, records):
+        with path.open('w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(records[0]))
+            writer.writeheader()
+            writer.writerows(records)
+
+    def save_epoch(epoch, name, metrics, records, learning_rate):
+        path = output / 'epoch_metrics.csv'
+        exists = path.exists()
+        with path.open('a', newline='') as f:
+            fields = ['epoch', 'split', 'loss', 'accuracy', 'correct', 'total', 'uar', 'macro_f1', 'learning_rate']
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(dict(epoch=epoch, split=name, learning_rate=learning_rate,
+                                 **{k: metrics[k] for k in fields if k in metrics}))
+        save_predictions(prediction_dir / ('%s_epoch_%03d.csv' % (name, epoch)), records)
 
     best = -1.0
     for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        for v, a, y in loaders['train']:
-            optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(v.to(device), a.to(device)), y.to(device))
-            if not torch.isfinite(loss):
-                raise RuntimeError('Nonfinite training loss')
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item() * len(y)
-        scheduler.step()
-        metrics, *_ = evaluate(loaders['val'])
-        record = dict(epoch=epoch+1, train_loss=total_loss/len(splits['train']), val=metrics)
-        print(json.dumps(record), flush=True)
-        with (output / 'history.jsonl').open('a') as f:
-            f.write(json.dumps(record) + '\n')
+        learning_rate = optimizer.param_groups[0]['lr']
+        train_metrics, train_records = run_pass(loaders['train'], training=True)
+        metrics, val_records = run_pass(loaders['val'])
+        save_epoch(epoch+1, 'train', train_metrics, train_records, learning_rate)
+        save_epoch(epoch+1, 'val', metrics, val_records, learning_rate)
+        # Checkpoint selection uses validation ONLY, irrespective of monitored test results.
         if metrics['uar'] > best:
             best = metrics['uar']
             torch.save(dict(model=model.state_dict(), args=vars(args), epoch=epoch+1,
                             emotions=EMOTIONS, val=metrics), output / 'best.pth')
+        tests = {}
+        if not args.skip_epoch_tests:
+            for condition in TEST_CONDITIONS:
+                name = 'test_' + condition
+                tests[condition], records = run_pass(loaders[name])
+                save_epoch(epoch+1, name, tests[condition], records, learning_rate)
+        record = dict(epoch=epoch+1, train=train_metrics, val=metrics, tests=tests,
+                      learning_rate=learning_rate)
+        print(json.dumps(record), flush=True)
+        with (output / 'history.jsonl').open('a') as f:
+            f.write(json.dumps(record) + '\n')
+        scheduler.step()
     best_state = torch.load(output / 'best.pth', map_location=device)
     model.load_state_dict(best_state['model'])
     summary = {}
     for condition in TEST_CONDITIONS:
-        metrics, labels, predictions, probabilities = evaluate(loaders['test_' + condition])
-        summary[condition] = metrics
-        (output / f'test_metrics_{condition}.json').write_text(json.dumps(metrics, indent=2))
-        with (output / f'test_predictions_{condition}.csv').open('w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['video', 'actor', 'neutral_video', 'noise_seed', 'label', 'prediction']
-                            + [f'p_{e}' for e in EMOTIONS])
-            for row, y, pred, prob in zip(splits['test'], labels, predictions, probabilities):
-                writer.writerow([row['video'], row['actor'], row['neutral_video'], row['noise_seed'], y, pred] + prob)
-    (output / 'test_metrics.json').write_text(json.dumps(dict(emotions=EMOTIONS, conditions=summary), indent=2))
+        summary[condition], records = run_pass(loaders['test_' + condition])
+        (output / f'test_metrics_{condition}.json').write_text(json.dumps(summary[condition], indent=2))
+        save_predictions(output / f'test_predictions_{condition}.csv', records)
+    (output / 'test_metrics.json').write_text(json.dumps(
+        dict(emotions=EMOTIONS, best_epoch=best_state['epoch'], conditions=summary), indent=2))
     print('Best-validation checkpoint test results:', json.dumps(summary))
+    if not args.skip_explanations:
+        from video_loss_explanations import export_test_explanations
+        export_test_explanations(model, loaders, splits['test'], TEST_CONDITIONS,
+                                 device, output, args.explain_limit)
 
 
 def main():
@@ -327,7 +367,14 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--noise-rms', type=float, default=0.05,
                         help='White-noise waveform RMS in video-only testing (default .05)')
+    parser.add_argument('--skip-epoch-tests', action='store_true',
+                        help='Evaluate test conditions only after training, not every epoch')
+    parser.add_argument('--skip-explanations', action='store_true')
+    parser.add_argument('--explain-limit', type=int, default=0,
+                        help='Explain first N test trials in each condition; 0 means all')
     args = parser.parse_args()
+    if args.explain_limit < 0:
+        parser.error('--explain-limit must be nonnegative')
     if args.epochs < 1 or args.batch_size < 1 or args.depth < 1 or args.lr <= 0:
         parser.error('epochs, batch-size, depth and lr must be positive')
     if not args.prepare_only and not args.checkpoint:
