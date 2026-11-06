@@ -16,12 +16,15 @@ class EpochOutputsTests(unittest.TestCase):
         import run_ravdess_interaction as experiment
 
         class Dataset(torch.utils.data.Dataset):
-            def __init__(self):
+            def __init__(self, expanded=False):
                 self.rows = [dict(video=str(i), actor=1, label=i) for i in range(6)]
+                if expanded:
+                    self.rows = experiment.expand_training_rows(self.rows)
             def __len__(self):
-                return 6
+                return len(self.rows)
             def __getitem__(self, i):
-                return torch.eye(6)[i], torch.zeros(6), i, i
+                label = self.rows[i]['label']
+                return torch.eye(6)[label], torch.zeros(6), label, i
 
         class Model(torch.nn.Module):
             def __init__(self):
@@ -37,6 +40,7 @@ class EpochOutputsTests(unittest.TestCase):
         dataset = Dataset()
         loaders = {name: torch.utils.data.DataLoader(dataset, batch_size=3)
                    for name in ['train', 'test_both', 'test_video_noise', 'test_audio_neutral']}
+        loaders['train'] = torch.utils.data.DataLoader(Dataset(expanded=True), batch_size=3, shuffle=True)
         args = SimpleNamespace(seed=42, device='cpu', checkpoint='unused', lr=.001,
                                epochs=2, skip_epoch_tests=False, skip_explanations=True)
         with tempfile.TemporaryDirectory() as temporary:
@@ -47,14 +51,19 @@ class EpochOutputsTests(unittest.TestCase):
                 experiment.train({name: dataset.rows for name in ('train', 'test')}, args, output)
             with (output / 'epoch_metrics.csv').open() as f:
                 metrics = list(csv.DictReader(f))
-            self.assertEqual(len(metrics), 8)
+            self.assertEqual(len(metrics), 14)
+            for row in metrics:
+                if row['split'] == 'train':
+                    self.assertEqual(int(row['total']), 18)
+                elif row['split'].startswith('train_'):
+                    self.assertEqual(int(row['total']), 6)
             self.assertTrue((output / 'final.pth').exists())
             self.assertTrue((output / 'classifier_weights.npz').exists())
             self.assertFalse((output / 'best.pth').exists())
             self.assertFalse(any(row['split'] == 'val' for row in metrics))
             for row in metrics:
                 self.assertAlmostEqual(float(row['accuracy']), int(row['correct']) / int(row['total']))
-            self.assertEqual(len(list((output / 'epoch_predictions').glob('*.csv'))), 8)
+            self.assertEqual(len(list((output / 'epoch_predictions').glob('*.csv'))), 14)
             summary = json.loads((output / 'test_metrics.json').read_text())
             self.assertEqual(summary['checkpoint_epoch'], 2)
             self.assertEqual(summary['checkpoint_selection'], 'final_epoch')
