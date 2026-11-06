@@ -71,13 +71,16 @@ def load_epochs(run):
     return groups
 
 
-def plot_epoch_curves(groups, save, best_epoch, dpi, warnings):
+def plot_epoch_curves(groups, save, best_epoch, dpi, warnings, checkpoint_label="Best validation epoch"):
     specifications = [
         ('training_validation_accuracy', [('train', 'Training (online)', '#2864B4'),
                                            ('val', 'Validation', '#D37B20')],
          'Training and validation accuracy'),
         ('testing_accuracy_conditions', [('test_' + c, NAMES[c], COLORS[c]) for c in CONDITIONS],
          'Test accuracy across conditions')]
+    if not groups.get('val'):
+        specifications[0] = ('training_accuracy', [('train', 'Training (online)', '#2864B4')],
+                             'Training accuracy — no validation split')
     for filename, curves, title in specifications:
         fig, ax = plt.subplots(figsize=(8.5, 5))
         plotted = 0
@@ -92,7 +95,7 @@ def plot_epoch_curves(groups, save, best_epoch, dpi, warnings):
         ax.axhline(100 / len(EMOTIONS), color='.65', linestyle=':', label='Chance (16.7%)')
         if best_epoch is not None:
             ax.axvline(best_epoch, color='.35', linestyle='--', linewidth=1,
-                       label='Best validation epoch (%d)' % best_epoch)
+                       label=checkpoint_label + ' (%d)' % best_epoch)
         if not plotted:
             ax.text(.5, .55, 'No per-epoch accuracy records available', ha='center', transform=ax.transAxes)
         ax.set(xlabel='Epoch', ylabel='Accuracy (%)', title=title, ylim=(0, 100))
@@ -104,7 +107,7 @@ def plot_epoch_curves(groups, save, best_epoch, dpi, warnings):
         save_figure(fig, save / filename, dpi)
 
 
-def analyze_predictions(run, save, dpi):
+def analyze_predictions(run, save, dpi, checkpoint_description="best-validation checkpoint"):
     summaries, targets = [], {}
     for condition in CONDITIONS:
         rows = read_csv(run / ('test_predictions_' + condition + '.csv'))
@@ -139,7 +142,7 @@ def analyze_predictions(run, save, dpi):
     ax.set_xticks(x)
     ax.set_xticklabels([s.capitalize() for s in EMOTIONS])
     ax.set(ylabel='Accuracy within true emotion (%)', ylim=(0, 110),
-           title='Test accuracy by emotion — best-validation checkpoint')
+           title='Test accuracy by emotion — ' + checkpoint_description)
     ax.spines[['top', 'right']].set_visible(False)
     ax.grid(axis='y', alpha=.2)
     ax.set_axisbelow(True)
@@ -264,15 +267,20 @@ def main():
     if summary.get('emotions', EMOTIONS) != EMOTIONS:
         raise ValueError('Saved class order differs from expected six-emotion experiment')
     groups = load_epochs(run)
-    plot_epoch_curves(groups, save, summary.get('best_epoch'), args.dpi, warnings)
-    targets = analyze_predictions(run, save, args.dpi)
+    final_epoch = summary.get('checkpoint_selection') == 'final_epoch'
+    checkpoint_epoch = summary.get('checkpoint_epoch', summary.get('best_epoch'))
+    description = 'final-epoch checkpoint' if final_epoch else 'best-validation checkpoint'
+    plot_epoch_curves(groups, save, checkpoint_epoch, args.dpi, warnings,
+                      'Final epoch' if final_epoch else 'Best validation epoch')
+    targets = analyze_predictions(run, save, args.dpi, description)
     counts = aggregate_heatmaps(run, save, targets, args.dpi, warnings)
-    report = dict(run_dir=str(run), best_epoch=summary.get('best_epoch'), emotions=EMOTIONS,
+    report = dict(run_dir=str(run), checkpoint_epoch=checkpoint_epoch,
+                  checkpoint_selection=summary.get('checkpoint_selection', 'best_validation'), emotions=EMOTIONS,
                   conditions=NAMES, warnings=warnings, heatmap_counts=counts,
                   heatmap_averaging='Positive native map / saved shared trial scale, averaged over tubelets then trials',
                   interpretation='Positive loss relevance; model-input coordinates without facial registration',
                   training_accuracy='Online training crops and changing within-epoch weights',
-                  bar_plot='Final best-validation-checkpoint predictions, grouped by true emotion')
+                  bar_plot=description + ' predictions, grouped by true emotion')
     (save / 'analysis_report.json').write_text(json.dumps(report, indent=2))
     print('Saved analysis to:', save)
     for warning in warnings:
