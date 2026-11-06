@@ -26,9 +26,13 @@ class EpochOutputsTests(unittest.TestCase):
         class Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.head = torch.nn.Linear(6, 6)
-            def forward(self, v, a):
-                return self.head(v + a)
+                self.wv = torch.nn.Linear(6, 6, bias=False)
+                self.wa = torch.nn.Linear(6, 6, bias=False)
+                self.wf = torch.nn.Linear(6, 6, bias=False)
+            def forward(self, v, a, return_terms=False):
+                terms = (self.wv(v), self.wa(a), self.wf(v*a))
+                logits = sum(terms)
+                return (logits, terms) if return_terms else logits
 
         dataset = Dataset()
         loaders = {name: torch.utils.data.DataLoader(dataset, batch_size=3)
@@ -45,6 +49,7 @@ class EpochOutputsTests(unittest.TestCase):
                 metrics = list(csv.DictReader(f))
             self.assertEqual(len(metrics), 8)
             self.assertTrue((output / 'final.pth').exists())
+            self.assertTrue((output / 'classifier_weights.npz').exists())
             self.assertFalse((output / 'best.pth').exists())
             self.assertFalse(any(row['split'] == 'val' for row in metrics))
             for row in metrics:
@@ -60,6 +65,9 @@ class EpochOutputsTests(unittest.TestCase):
                 self.assertEqual(len(rows), 6)
                 for row in rows:
                     self.assertEqual(int(row['correct']), int(row['label'] == row['prediction']))
+                    for emotion in experiment.EMOTIONS:
+                        total = sum(float(row[b + '_logit_' + emotion]) for b in ('video', 'audio', 'interaction'))
+                        self.assertAlmostEqual(total, float(row['logit_' + emotion]), places=5)
 
 
 if __name__ == '__main__':
