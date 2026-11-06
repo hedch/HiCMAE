@@ -14,6 +14,7 @@ EMOTIONS = ['happy', 'sad', 'angry', 'fearful', 'surprised', 'disgusted']
 EMOTION_CODES = {3: 0, 4: 1, 5: 2, 6: 3, 8: 4, 7: 5}
 NUM_CLASSES = len(EMOTIONS)
 TEST_CONDITIONS = ('both', 'video_noise', 'audio_neutral')
+LOGIT_TERMS = ('video', 'interaction')
 
 
 def discover(video_root, audio_root):
@@ -151,7 +152,10 @@ def make_model(args):
             self.video_layer_weights = backbone.video_layer_weights
             self.audio_layer_weights = backbone.audio_layer_weights
             self.wv = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
-            self.wa = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
+            self.logit_terms = tuple(getattr(args, 'logit_terms', LOGIT_TERMS))
+            # Only legacy explanation reruns explicitly request the old audio head.
+            if 'audio' in self.logit_terms:
+                self.wa = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
             self.wf = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
 
         def forward(self, video, audio, return_terms=False):
@@ -159,8 +163,11 @@ def make_model(args):
             a = self.encoder_audio(audio).mean(dim=1)
             ov = (v * self.video_layer_weights.softmax(0)[None, :, None]).sum(1)
             oa = (a * self.audio_layer_weights.softmax(0)[None, :, None]).sum(1)
-            terms = (self.wv(ov), self.wa(oa), self.wf(ov * oa))
-            logits = terms[0] + terms[1] + terms[2]
+            values = dict(video=self.wv(ov), interaction=self.wf(ov * oa))
+            if 'audio' in self.logit_terms:
+                values['audio'] = self.wa(oa)
+            terms = tuple(values[name] for name in self.logit_terms)
+            logits = sum(terms)
             return (logits, terms) if return_terms else logits
 
     return InteractionModel()
@@ -280,7 +287,7 @@ def train(splits, args, output):
                 target = y.to(device)
                 logits, terms = model(v.to(device), a.to(device), return_terms=True)
                 # Terms come from this exact forward pass, including during training.
-                torch.testing.assert_close(logits, terms[0] + terms[1] + terms[2])
+                torch.testing.assert_close(logits, sum(terms))
                 batch_losses = torch.nn.functional.cross_entropy(logits, target, reduction='none')
                 loss = batch_losses.mean()
                 if not torch.isfinite(loss):
@@ -310,7 +317,7 @@ def train(splits, args, output):
                                   label=label, prediction=prediction, correct=int(label == prediction), loss=value)
                     record.update(zip(['p_' + e for e in EMOTIONS], probability))
                     record.update(zip(['logit_' + e for e in EMOTIONS], logit_values[offset]))
-                    for branch, branch_values in zip(('video', 'audio', 'interaction'), term_values):
+                    for branch, branch_values in zip(model.logit_terms, term_values):
                         record.update(zip([branch + '_logit_' + e for e in EMOTIONS], branch_values[offset]))
                     records.append(record)
         metrics = dict(loss=float(np.mean(losses)), accuracy=float(accuracy_score(labels, predictions)),
@@ -374,11 +381,12 @@ def train(splits, args, output):
     # Fixed final epoch: test monitoring never selects a checkpoint.
     torch.save(dict(model=model.state_dict(), args=vars(args), epoch=args.epochs,
                     emotions=EMOTIONS, checkpoint_selection='final_epoch'), output / 'final.pth')
-    np.savez_compressed(output / 'classifier_weights.npz',
-                        wv=model.wv.weight.detach().cpu().numpy(),
-                        wa=model.wa.weight.detach().cpu().numpy(),
-                        wf=model.wf.weight.detach().cpu().numpy(),
-                        emotions=np.asarray(EMOTIONS))
+    weights = dict(wv=model.wv.weight.detach().cpu().numpy(),
+                   wf=model.wf.weight.detach().cpu().numpy(),
+                   emotions=np.asarray(EMOTIONS), logit_terms=np.asarray(model.logit_terms))
+    if 'audio' in model.logit_terms:
+        weights['wa'] = model.wa.weight.detach().cpu().numpy()
+    np.savez_compressed(output / 'classifier_weights.npz', **weights)
     summary = {}
     for condition in TEST_CONDITIONS:
         summary[condition], records = run_pass(loaders['test_' + condition])
@@ -386,7 +394,7 @@ def train(splits, args, output):
         save_predictions(output / f'test_predictions_{condition}.csv', records)
     (output / 'test_metrics.json').write_text(json.dumps(
         dict(emotions=EMOTIONS, checkpoint_epoch=args.epochs, checkpoint_file='final.pth',
-             checkpoint_selection='final_epoch', conditions=summary), indent=2))
+             checkpoint_selection='final_epoch', logit_terms=list(model.logit_terms), conditions=summary), indent=2))
     print('Final-epoch checkpoint test results:', json.dumps(summary))
     if not args.skip_explanations:
         from video_loss_explanations import export_test_explanations
@@ -418,6 +426,7 @@ def main():
                         help='Explain first N test trials in each condition; 0 means all')
     args = parser.parse_args()
     args.training_conditions = list(TEST_CONDITIONS)
+    args.logit_terms = list(LOGIT_TERMS)
     if args.explain_limit < 0:
         parser.error('--explain-limit must be nonnegative')
     if args.epochs < 1 or args.batch_size < 1 or args.depth < 1 or args.lr <= 0:
