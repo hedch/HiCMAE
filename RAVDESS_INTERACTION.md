@@ -21,7 +21,7 @@ No validation set is created or evaluated. A class with fewer than 192 unique
 trials produces an error instead of changing the requested counts. Extra trials
 beyond 192 per class are left unused and reported. With complete RAVDESS speech
 data, all 1152 selected emotion trials are retained. Neutral and calm are excluded
-from classification; neutral clips supply only test visual controls.
+from classification targets; neutral clips supply visual input controls in training and testing.
 
 `train.csv`, `test.csv`, and `split_report.json` record selections, counts, seed,
 actor overlap and any unused trials. Existing runs are not changed: use a NEW
@@ -38,8 +38,9 @@ The B x D pooled vectors feed independent bias-free D-to-6 linear maps:
 logits = wv(ov) + wa(oa) + wf(ov * oa)
 ```
 
-The product is elementwise. Both encoders train with paired emotional audio/video
-using cross entropy on raw logits, without reconstruction or contrastive loss.
+The product is elementwise. Both encoders train with a shuffled mixture of paired emotional audio/video,
+emotional video with white noise, and emotional audio with a static neutral face,
+using cross entropy on raw logits without reconstruction or contrastive loss.
 Class labels 0..5 are happy, sad, angry, fearful, surprised, disgusted.
 RAVDESS codes are 03, 04, 05, 06, 08, 07 in that order.
 
@@ -110,7 +111,7 @@ three terms in the classifier stay active. White noise is generated in waveform
 space before audio preprocessing; `--noise-rms` defaults to 0.05, fixed across
 trials, with seeds saved per trial. Neutral clips match the actor, statement and
 repetition of the emotional trial. The midpoint frame is repeated. These controls
-remain excluded from training targets; matching actors can now occur in training.
+are used as inputs during training and testing; neutral is never an emotion target.
 
 `epoch_metrics.csv` and `history.jsonl` record training and all three test conditions
 each epoch: loss, accuracy, correct/total, UAR, macro F1, learning rate and (in JSON)
@@ -235,3 +236,45 @@ the input-replacement comparison.
 No additional analysis command is needed. Older CSVs without the new columns still
 produce the existing plots and a clear warning that contribution analyses were
 skipped. Use a new output directory for retraining to obtain the contribution data.
+
+
+## Expanded three-condition training
+
+After the original 128/64-per-emotion split, every TRAINING trial is expanded into
+three examples: `both`, `video_noise`, and `audio_neutral`. Targets remain the
+original emotional label. The loader uses `shuffle=True` over the full expanded
+list each epoch; training is not grouped by condition. Every epoch includes:
+
+| Condition | Per emotion | All six emotions |
+| --- | ---: | ---: |
+| Original audio + video | 128 | 768 |
+| Emotional video + white noise | 128 | 768 |
+| Emotional audio + static neutral face | 128 | 768 |
+| Total presented training examples | 384 | 2304 |
+
+These are 768 unique emotional training trials presented under three conditions,
+not 2304 independent original recordings. Test membership remains 64 unique trials
+per emotion, 384 total, evaluated under each condition. Expansion occurs only AFTER
+splitting and never uses a held-out emotional trial. Static neutral references match
+actor, statement and repetition in both sets. Since actors are mixed across sets,
+neutral control references can be shared across sets; emotional trials remain disjoint.
+
+`train.csv` retains the 768 unique training trials, with neutral references and noise
+base seeds. `train_expanded.csv` records all 2304 condition-labeled examples. The
+split report records both unique-trial counts and expanded-example counts.
+Training white noise uses base_seed + zero_based_epoch * 1000000, giving fresh but
+reproducible noise each epoch, with train/test seed ranges kept separate. Test noise
+stays fixed for comparison. The actual seed and condition are saved in prediction
+CSVs. No new command-line options are needed.
+
+Aggregate training metrics summarize all 2304 presentations. Additional `train_both`,
+`train_video_noise`, and `train_audio_neutral` records in epoch metrics/predictions
+summarize each condition separately. The analysis script automatically adds
+`training_accuracy_conditions.png/.pdf`. Modality-contribution recording, final-epoch
+checkpoint selection, test conditions and explanation export are preserved.
+
+With the same batch size, each epoch now has approximately three times as many
+optimizer steps. Use a NEW output directory and retrain; old completed runs are
+not modified. Preparation/expansion tests verify exact counts, neutral references
+and no overlap with held-out emotional trials. Full PyTorch execution remains
+unverified in the editing environment.
