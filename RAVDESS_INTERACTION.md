@@ -190,3 +190,48 @@ CLI was checked against a synthetic complete 1440-trial dataset: 128/64 per targ
 emotion, no validation, no overlapping trials, all actors mixed, controls matched.
 Analysis was checked with synthetic known results. Full training/attribution checks
 require PyTorch and real data, unavailable in the editing environment.
+
+## Modality contributions recorded during retraining
+
+The runner now calls the model with `return_terms=True` and records the actual
+feature-dependent video, audio, and interaction logits for every class. These are
+saved in both epoch prediction CSVs and final test prediction CSVs as
+`video_logit_{emotion}`, `audio_logit_{emotion}`, `interaction_logit_{emotion}`,
+and total `logit_{emotion}`. The runner checks the terms sum to the total. No
+additional forward pass or inference is required for the analysis. Final weight
+matrices are also saved in `classifier_weights.npz` (wv, wa, wf and class order),
+but weight magnitudes alone are not treated as modality reliance.
+
+The same single `analyze_ravdess_results.py` script automatically adds a
+`modality_contributions/` output folder containing:
+
+- `true_logit_contributions.png/.pdf`: mean contributions to the true emotion's score.
+- `margin_contributions.png/.pdf`: signed contributions to the true-versus-competitor margin.
+- `absolute_margin_shares.png/.pdf`: mean fractional shares of absolute margin magnitude.
+- `term_removal_accuracy_drop.png/.pdf`: accuracy change when one score term is removed.
+- `trial_contributions.csv`, `contributions_by_emotion.csv`, and `term_ablation_accuracy.csv`.
+
+All summaries use final-epoch test outputs and group by true emotion, separately
+for all three testing conditions. Every trial is included, whether correctly
+classified or not. The competing emotion is chosen once per trial as the highest
+wrong-class score under the original audio+video condition; it stays fixed across
+branches and conditions. This makes each three-term margin decomposition exact
+and comparable across conditions. Positive margins support the true class over
+that competitor; negative margins support the competitor. Means may cancel opposing
+contributions, so mean absolute magnitudes and positive fractions are saved too.
+Absolute shares ignore direction and are not probabilities of reliance. All-zero
+margins receive zero shares and are flagged at trial level.
+
+Term ablations recompute predictions by omitting selected recorded score terms,
+without changing features or retraining. The CSV also includes full scores and
+video-only, audio-only, and interaction-only score predictions. Dropping the video
+term still leaves visual information in the interaction; it is not a complete
+video-modality removal. Likewise for audio. A positive accuracy drop means omission
+hurt performance; negative values mean it improved performance. These describe
+the trained model's behavior, not human emotion processing or causal attribution
+to individual input pixels. The existing three-condition accuracy plots remain
+the input-replacement comparison.
+
+No additional analysis command is needed. Older CSVs without the new columns still
+produce the existing plots and a clear warning that contribution analyses were
+skipped. Use a new output directory for retraining to obtain the contribution data.
