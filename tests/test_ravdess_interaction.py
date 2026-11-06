@@ -145,7 +145,9 @@ class ModelTests(unittest.TestCase):
         v, a = torch.randn(2, 3, 1, 384), torch.randn(2, 4, 1, 384)
         logits = model(v, a)
         ov, oa = v.mean(1).squeeze(1), a.mean(1).squeeze(1)
-        expected = model.wv(ov) + model.wa(oa) + model.wf(ov * oa)
+        self.assertFalse(hasattr(model, 'wa'))
+        self.assertEqual(model.logit_terms, ('video', 'interaction'))
+        expected = model.wv(ov) + model.wf(ov * oa)
         torch.testing.assert_close(logits, expected)
         torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1])).backward()
         for name, param in model.named_parameters():
