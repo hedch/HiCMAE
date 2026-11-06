@@ -1,250 +1,192 @@
 # Six-emotion RAVDESS interaction experiment
 
-Fine-tune both HiCMAE encoders using paired audio/video. Evaluate the SAME selected
-test trials with the SAME best-validation checkpoint in three conditions:
+## Current split: mixed actors, no validation
 
-| Condition | Video | Audio |
-| --- | --- | --- |
-| `both` | Original emotional clip | Original speech |
-| `video_noise` | Original emotional clip | Gaussian white noise |
-| `audio_neutral` | Static neutral face, repeated for 16 frames | Original speech |
+Each emotion is shuffled independently with `--seed` (default 42). The first 128
+trials train and the next 64 test. Actors are mixed across the sets, and no
+emotional trial can appear in both. This evaluates new trials with familiar actors,
+rather than holding out actor identities.
 
-The model still receives both tensors in every condition, and all three terms in
-its logit formula remain active. These are stimulus-replacement conditions, not
-branch disabling: neutral-face and noise embeddings can contribute to the logits.
+| Emotion | Training | Testing |
+| --- | ---: | ---: |
+| Happy | 128 | 64 |
+| Sad | 128 | 64 |
+| Angry | 128 | 64 |
+| Fearful | 128 | 64 |
+| Surprised | 128 | 64 |
+| Disgusted | 128 | 64 |
+| Total | 768 | 384 |
 
-## Model and labels
+No validation set is created or evaluated. A class with fewer than 192 unique
+trials produces an error instead of changing the requested counts. Extra trials
+beyond 192 per class are left unused and reported. With complete RAVDESS speech
+data, all 1152 selected emotion trials are retained. Neutral and calm are excluded
+from classification; neutral clips supply only test visual controls.
 
-The cross-modal fusion encoder is absent. Each encoder's tokens are mean-pooled
-and layers combined using learned softmax weights, as in HiCMAE. The B x D output
-vectors feed three unconstrained, bias-free learned D-to-6 linear maps:
+`train.csv`, `test.csv`, and `split_report.json` record selections, counts, seed,
+actor overlap and any unused trials. Existing runs are not changed: use a NEW
+output directory and retrain for this split. The old `--val-actors` and
+`--test-actors` arguments have been removed.
+
+## Model
+
+The cross-modal fusion encoder is absent. Video and audio encoder outputs are
+mean-pooled over tokens and combined across layers with learned softmax weights.
+The B x D pooled vectors feed independent bias-free D-to-6 linear maps:
 
 ```
 logits = wv(ov) + wa(oa) + wf(ov * oa)
 ```
 
-`*` is elementwise multiplication. The weights are matrices, not scalar mixture
-weights. Cross entropy receives raw logits. Training and validation always use
-original paired emotional audio/video; no noise, neutral substitutions,
-reconstruction loss, or contrastive loss are used during fine-tuning.
+The product is elementwise. Both encoders train with paired emotional audio/video
+using cross entropy on raw logits, without reconstruction or contrastive loss.
+Class labels 0..5 are happy, sad, angry, fearful, surprised, disgusted.
+RAVDESS codes are 03, 04, 05, 06, 08, 07 in that order.
 
-Class order (labels 0 through 5): **happy, sad, angry, fearful, surprised,
-disgusted**. RAVDESS codes map 03->0, 04->1, 05->2, 06->3, 08->4, 07->5.
-Neutral and calm are excluded from all classification targets. Neutral speech
-videos are retained solely as test control stimuli.
+Defaults match the released base checkpoint: D=512, 10 layers per encoder,
+16 video frames at 160 x 160, audio filterbanks of 256 x 128. Use `--embed-dim 384`
+and a matching `--depth` for another checkpoint. Encoder names/shapes must match;
+fusion, reconstruction decoder and old classifier weights are ignored.
 
-Defaults match the released base checkpoint: embedding dimension 512, 10 layers
-per encoder, 16 video frames at 160 x 160, 256 x 128 audio filterbanks. Other
-checkpoints can use `--embed-dim 384` and `--depth`. All encoder parameter names
-and shapes must match. Fusion, decoder, and old head weights are discarded.
+## Data and dependencies
 
-## Data
-
-Use the repository's existing Python 3.8 / PyTorch / torchaudio / timm 0.4.12 /
-einops / decord / NumPy / scikit-learn / Pillow environment.
-
-Download RAVDESS speech videos and WAVs from https://zenodo.org/records/1188976.
-Keep neutral speech videos available for the test control. Extract the archives
-and pass the video and audio parent directories; subdirectories are searched.
-
-Example paired filenames:
+Use the upstream Python/PyTorch environment with torchaudio, timm 0.4.12, einops,
+decord, NumPy, scikit-learn and Pillow. Analysis also uses Matplotlib.
+Download the speech videos and WAVs from https://zenodo.org/records/1188976.
+Keep neutral clips available. Flat folders and actor subfolders both work.
 
 ```
-videos/Actor_01/02-01-05-01-01-01-01.mp4
-audio/Actor_01/03-01-05-01-01-01-01.wav
+videos/01-01-05-01-01-01-01.mp4
+audio/01-01-05-01-01-01-01.wav
 ```
 
-Both video-only (02) and full-AV (01) MP4 modalities are accepted; video-only is
-preferred if both exist. WAV files with prefixes 03 (official audio-only), 01 (full-AV exports), or 02 (video-only-named exports) are paired using the remaining six filename fields. If multiple audio versions exist, preference is 03, then 01, then 02. File extensions are case-insensitive. Identically named 01-prefixed MP4/WAV pairs in flat folders are supported. Song
-files are excluded. All discovered speech videos, including neutral controls,
-currently require matching WAVs. Audio is resampled to 16 kHz internally.
+MP4 prefixes 01 and 02 are accepted; prefix 02 is preferred if both exist.
+WAV prefixes 03, 01, and 02 are accepted in that priority order. Pairing uses the
+six non-modality filename fields. Extensions are case-insensitive. All discovered
+speech videos currently require matching WAVs, including neutral clips. Song is
+excluded. Preserve original filenames and a shared video/audio time origin.
 
-Face-cropped MP4s retaining the original filename, full duration, and frame rate
-are preferable for transfer from the face-pretrained model. Raw MP4s are accepted,
-but the center square crop is NOT a face detector. Extracted image folders are
-not supported by this standalone script. Video and audio must share a time origin.
+Audio is resampled to 16 kHz. Face-cropped MP4s retaining full duration/frame rate
+are preferable for the face-pretrained model; raw MP4s work but the center square
+crop is not a face detector. Extracted image folders are not supported.
 
-Emotional clips use synchronized 2.56-second windows: random in training and
-centered in validation/testing. Video is sampled into 16 frames; short audio is
-zero-padded. Video uses ImageNet normalization and filterbanks use the original
-AudioSet normalization. A data-loading failure stops execution.
+A synchronized 2.56-second window is random during training and centered in
+testing. Video is sampled into 16 frames; short audio is zero-padded. Video uses
+ImageNet normalization and filterbanks use upstream AudioSet normalization.
 
-## Test controls
+## Run in a new output folder
 
-White noise is generated in the **waveform domain** at 16 kHz for 2.56 seconds,
-then passed through the same filterbank and normalization as speech. Every trial
-has a saved noise seed. The default waveform RMS is 0.05 on the conventional
-floating audio scale; change it with `--noise-rms`. This is fixed across trials,
-not matched to original emotional speech amplitude. No original speech enters the
-noise replacement. This amplitude is an experimental choice, not a calibrated
-sound-pressure level.
-
-The neutral face is the midpoint frame of the neutral speech clip from the **same
-test actor**, matched on statement and repetition. That single frame is repeated
-across all 16 video frames. This avoids articulatory motion in the visual control.
-It is a neutral-labeled frame, not a synthesized or independently validated face.
-The neutral reference never comes from a training or validation actor. Missing
-references produce an explicit error. `test.csv` saves the reference path and
-noise seed used for each trial.
-
-All conditions retain exactly the same emotional speech/video trial IDs, labels,
-and test ordering. Only the specified input is replaced. The original six-way
-label stays unchanged in all conditions.
-
-## Balancing and split
-
-A seeded shuffle assigns 16 actors to training, 4 to validation, and 4 to testing.
-Choose custom groups by passing BOTH `--val-actors` and `--test-actors`; remaining
-actors train. Within EACH split, all six target emotions are deterministically
-undersampled without replacement to the smallest class count. On complete speech
-data these six emotions are already equal, so all 1152 target trials are retained:
-128 per class in training, 32 per class in validation, and 32 per class in testing.
-The saved manifests/report record actual selections; incomplete data may reduce counts.
-
-## Run
-
-Check discovery, balancing, and neutral references without ML dependencies:
+Preparation check (without ML dependencies):
 
 ```bash
-python run_ravdess_interaction.py --video-root /path/to/videos --audio-root /path/to/audio --output-dir runs/ravdess_check --prepare-only
+python run_ravdess_interaction.py --video-root /path/to/videos --audio-root /path/to/audio --output-dir runs/mixed_check --prepare-only
 ```
 
-Train and automatically run all three test conditions:
+Fine-tune and run all tests/explanations:
 
 ```bash
-python run_ravdess_interaction.py --video-root /path/to/videos --audio-root /path/to/audio --checkpoint /path/to/checkpoint-99.pth --output-dir runs/ravdess_six --batch-size 4 --epochs 50 --lr 1e-4 --noise-rms 0.05
+python run_ravdess_interaction.py --video-root /path/to/videos --audio-root /path/to/audio --checkpoint /path/to/checkpoint-99.pth --output-dir runs/ravdess_mixed --epochs 50 --batch-size 4 --device cuda
 ```
 
-Use a fresh output directory every time, including after preparation. Only load
-trusted checkpoint files. Default device is CUDA; `--device cpu` runs on CPU.
-This is a single-device, full-precision script with zero loader workers for
-Windows support. Multi-GPU/DDP, automatic download, and resume are not implemented.
+Use a new/empty output directory for every invocation. Output directories are
+created automatically. This single-device script uses full precision and zero
+loader workers for Windows support. Reduce batch size for GPU memory limits.
+Use `--device cpu` for CPU execution. No resume or DDP is implemented.
 
-## Saved epoch and final results
+There is no validation-based or test-based checkpoint selection. The final
+requested epoch is saved as `final.pth` and used for final metrics/explanations.
+The new runner does not create `best.pth` or `val.csv`.
 
-Every epoch saves training, validation, and all three test conditions to
-`epoch_metrics.csv` and `history.jsonl`: mean cross-entropy loss, accuracy,
-correct/total counts, UAR, macro F1, and learning rate. Confusion matrices are
-included in JSON. Each split/condition also gets a per-trial CSV in
-`epoch_predictions/`, containing trial ID, true/predicted label, correctness,
-loss, and six class probabilities.
+## Three test conditions and saved metrics
 
-Training metrics are online values collected on the random training crops before
-each optimizer update, across changing model weights. Validation/test values use
-fixed centered inputs and the end-of-epoch weights in evaluation mode.
+| Condition | Video | Audio |
+| --- | --- | --- |
+| both | Original emotional clip | Original speech |
+| video_noise | Original emotional clip | Seeded Gaussian white noise |
+| audio_neutral | Static neutral face repeated 16 times | Original speech |
 
-Checkpoint selection always uses paired-input validation UAR only. Epoch test
-results are monitoring outputs and never used to choose the checkpoint. To keep
-test evaluation until the end instead, pass `--skip-epoch-tests`.
+The same 384 test trials, labels and ordering are used in each condition. All
+three terms in the classifier stay active. White noise is generated in waveform
+space before audio preprocessing; `--noise-rms` defaults to 0.05, fixed across
+trials, with seeds saved per trial. Neutral clips match the actor, statement and
+repetition of the emotional trial. The midpoint frame is repeated. These controls
+remain excluded from training targets; matching actors can now occur in training.
 
-After training, the best-validation checkpoint is loaded and all three test
-conditions are evaluated again. `test_metrics.json` records the selected epoch
-and all condition metrics. Each condition also gets `test_metrics_{condition}.json`
-and `test_predictions_{condition}.csv`, including per-trial correctness and loss.
-These final results can differ from the last epoch because the selected epoch
-may be earlier. `best.pth`, configuration, split report, and manifests are saved.
+`epoch_metrics.csv` and `history.jsonl` record training and all three test conditions
+each epoch: loss, accuracy, correct/total, UAR, macro F1, learning rate and (in JSON)
+confusion matrices. `epoch_predictions/` saves trial predictions, correctness,
+loss and six probabilities. Training values are online predictions on random crops
+with changing within-epoch weights. Test values use fixed inputs and epoch-end
+weights. Tests are monitoring only; `--skip-epoch-tests` delays testing until the end.
 
-## Loss-based video explanations and masked frames
+Final results use `final.pth`: `test_metrics.json` includes `checkpoint_epoch` and
+`checkpoint_selection=final_epoch`; per-condition JSON/CSV files save metrics and
+predictions. `config.json` records the run options.
 
-Explanations run automatically AFTER training using the best-validation checkpoint.
-Only video is attributed, separately for every test trial and all three conditions.
-The target is each trial's true-label cross-entropy loss. Positive relevance means
-local contribution toward increasing the loss; it is not evidence supporting the
-correct emotion, nor a causal guarantee that masking changes the prediction.
+## Explanations and overlays
 
-This is a **Grad-ECLIP-inspired pooled-query adaptation**, based on
-https://github.com/Cyang-Zhao/Grad-Eclip. It does not use CLIP or introduce a CLS
-token. For every video transformer layer/head, the native attention output before
-its projection is captured. The channel weight for query i is the gradient of
-loss with respect to that query's per-head attention output. The source-token j
-score sums gradient/value channel products multiplied by per-query min-max-scaled
-cosine similarity between query i and key j. Scores sum across queries, heads,
-and layers. No learned pooling weights are multiplied a second time. Constant
-similarity rows receive zero spatial weights; normalization denominators are guarded.
-Layer aggregation is an attribution heuristic, not an exact loss decomposition.
+Video explanations run after training, using per-trial true-label cross-entropy
+loss. The Grad-ECLIP-inspired pooled-query adaptation captures native per-head
+attention outputs without replacing attention. Each query's loss gradient weights
+source value channels with min-max cosine query-key similarity. Contributions sum
+across queries, heads and video layers; learned pooling weights are accounted for
+by backpropagation, not multiplied again. This is a local attribution heuristic,
+not an exact or causal loss decomposition. Constant similarities yield zero weights.
+Hooked and ordinary logits are checked for equality. Weights stay fixed.
 
-Hooks observe the native attention computation without changing head counts,
-scaling, or model predictions. Every explanation checks hooked logits against
-an ordinary forward pass. Model weights remain fixed; parameter gradients are
-not accumulated. Explanations require autograd even though the model is in eval mode.
+`explanations/{condition}/{trial}/` contains:
 
-Output folders are:
+- `frame_XX_overlay.png`: translucent jet-style positive relevance over actual input.
+- `frame_XX_masked.png`: actual input multiplied by its positive mask.
+- `heatmaps.npz`: signed per-layer/native maps, positive/normalized maps and display masks.
+- `metadata.json`: labels, logits, loss, correctness, input controls, seeds and scale.
 
-- `explanations/both/{trial}/`
-- `explanations/video_noise/{trial}/`
-- `explanations/audio_neutral/{trial}/`
+Positive relevance means locally increasing the classification loss. Native maps
+are 8 x 10 x 10: each two-frame tubelet mask is spatially enlarged and repeated
+for those frames. Audio-only images show the actual neutral control face. The
+three conditions share a per-trial positive display maximum; scales are not shared
+across trials. Zero positive relevance leaves overlay images unchanged and produces
+black multiplicative masked images. Masked images are not reclassified.
 
-Each trial folder contains 16 `frame_XX_masked.png` images showing the ACTUAL
-160 x 160 center-cropped model input multiplied by its positive relevance mask.
-For audio-only tests these are the repeated static neutral face, not the replaced
-emotional video. Native maps are 8 x 10 x 10: each tubelet covers two frames.
-Masks are resized spatially and repeated for the two frames, without temporal
-interpolation or a claim of independent frame-level resolution.
+Default explains all trials. `--explain-limit 2` exports only two trials per condition;
+`--skip-explanations` disables exports. To re-export without retraining:
 
-`heatmaps.npz` contains signed native scores, signed per-layer scores, positive
-native scores, a per-condition normalized native map, and the shared-scale masks
-actually used to save images. Masked images use the maximum positive native score
-across all three conditions for THAT trial, preserving relative magnitudes within
-that comparison. The scale is not shared across different trials. All-zero positive
-scores produce black masked frames and zero masks, not NaNs.
+```bash
+python video_loss_explanations.py --output-dir /path/to/existing/run --device cuda
+```
 
-`metadata.json` records logits, loss, correctness, target label, forward-equivalence
-error, neutral reference, noise seed, and display scale. `explanations/index.jsonl`
-indexes all exports. Masking is a visualization step only: these masked images are
-not fed back through the classifier and do not alter saved test metrics.
+This uses `final.pth`, falling back to `best.pth` for older runs, and needs only
+train/test manifests. It rebuilds the explanation index and corresponding files
+without changing training/test metrics.
 
-For a quick export check, add `--explain-limit 2` to process only two test trials
-in each condition. Default 0 explains all test trials. `--skip-explanations` skips
-exports. Attribution runs one trial at a time and chunks query aggregation to
-limit temporary memory; it still adds computation and image files for each trial.
+## Analysis
 
-## Verification
+```bash
+python analyze_ravdess_results.py --run-dir /path/to/existing/run
+```
+
+All analysis is in this single script; it needs NumPy and Matplotlib, not PyTorch.
+Outputs default to RUN_DIR/analysis (`--save-dir` overrides). New runs get a
+training-only accuracy plot and three-condition test accuracy curves. Older runs
+with validation still get training/validation curves. Bars by true emotion use
+final predictions from the selected checkpoint (final epoch for new runs).
+
+Figures are PNG/PDF. Numeric summaries are CSV/JSON. Average heatmaps divide each
+positive native map by its saved shared per-trial scale, average over tubelets,
+then average trials equally. All 18 groups use a common color range. Raw signed
+and positive means and tubelet means are also saved as NPZ. These are model-input
+coordinates, not anatomically registered facial maps. All exported trials contribute,
+including incorrect predictions. Counts/warnings identify partial exports; missing
+groups are marked instead of invented. Export all explanations before global analysis.
+
+## Checks
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Data preparation tests need only Python. Optional dependency-backed tests cover
-head logits/gradients, seeded noise, chunked attribution against an explicit formula,
-constant/zero-map stability, tubelet-to-frame mapping, native forward equality,
-hook removal, saved image exports, and a miniature two-epoch run checking result
-files for all three conditions. In the editing environment six data tests passed;
-six dependency-backed tests were skipped because PyTorch is unavailable. Python
-compilation passed. Real media decoding, full-model attribution, and fine-tuning
-have not been executed here; run these checks in the project environment before
-a full experiment.
-
-## Retry explanation export without retraining
-
-If training and final testing completed but explanation export was interrupted,
-update `video_loss_explanations.py` and run it directly, pointing to the EXISTING
-run output directory (containing config.json, best.pth, and the three manifests):
-
-```bash
-python video_loss_explanations.py --output-dir /path/to/existing/run --device cuda --explain-limit 2
-```
-
-Omit `--explain-limit 2` to export all test trials. This loads the best checkpoint
-and saved trial selections, keeps training/test metrics untouched, and rebuilds
-`explanations/index.jsonl` while overwriting the corresponding explanation files.
-The original media paths in the manifests must still exist. In PyCharm, set this
-module as the script path and put the options in Parameters. This mode does not
-apply the training runner's empty-output-directory restriction.
-
-
-## Colored overlays
-
-Every explanation now additionally saves `frame_XX_overlay.png`: a jet-style color heatmap blended over the actual input frame. Maximum opacity is 0.45, multiplied by normalized positive relevance, so zero-relevance regions show the unchanged original image and the face remains visible at high relevance. The same per-trial scale across conditions is used. `frame_XX_masked.png` remains available as the multiplicative black-background visualization. Rerun the explanation-only command to add overlays to an existing trained run; no retraining is needed.
-
-The current runner uses one seeded 16/4/4 actor split. It does not implement the original repository's cross-validation folds (the repository supplies six RAVDESS split folders). Results from this runner are single-split results, not fold averages.
-
-
-## Analyze a finished run with one script
-
-Run `python analyze_ravdess_results.py --run-dir /path/to/existing/run`. Only NumPy and Matplotlib are required; it does not load the model, train, or regenerate explanations. In PyCharm select this script and use `--run-dir "D:/HiCMAE_results/run01"` as Parameters. Outputs default to RUN_DIR/analysis; optional `--save-dir` changes that destination.
-
-The script saves training/validation accuracy versus epoch, test accuracy for all three conditions versus epoch, and grouped accuracy bars by true emotion from the FINAL best-validation-checkpoint prediction CSVs (not the last-epoch monitoring results). Figures are PNG and PDF. Bars also show correct/total counts; `testing_accuracy_by_emotion.csv` stores the numbers. Curves require saved epoch results; if epoch tests were skipped the script reports their absence rather than inventing test curves.
-
-It averages saved positive native heatmaps divided by their saved per-trial shared display scale, first equally across tubelets and then equally across trials. All 18 emotion/condition means use one common color range. Separate PNG/PDF and NPZ files, including raw signed/positive means and tubelet-resolved averages, are saved under `average_heatmaps/`. `average_heatmaps_all_emotions_conditions.png/.pdf` shows the full grid. These are model-input-coordinate masks, not anatomically registered facial maps. All exported trials, including incorrect predictions, contribute equally.
-
-`heatmap_counts.csv` and `analysis_report.json` record coverage, averaging choices and warnings. When only some trials were explained (e.g. `--explain-limit 2`), means represent that subset, and the figures show n/exported versus expected test counts. Missing groups are marked and no arrays are invented. For complete averages, first run explanation-only export without a limit. Existing training/model files remain unchanged. Synthetic checks verified known class accuracies, exact mean-map values, all expected figure exports, and detection of partial heatmap coverage; original user result files were not available here.
+Data/metadata tests and syntax checks run in the editing environment. The preparation
+CLI was checked against a synthetic complete 1440-trial dataset: 128/64 per target
+emotion, no validation, no overlapping trials, all actors mixed, controls matched.
+Analysis was checked with synthetic known results. Full training/attribution checks
+require PyTorch and real data, unavailable in the editing environment.
