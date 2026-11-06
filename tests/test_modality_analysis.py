@@ -62,6 +62,32 @@ class ModalityAnalysisTests(unittest.TestCase):
             self.assertFalse(analyze_modality_contributions(root, root, 40, warnings))
             self.assertEqual(len(warnings), 1)
 
+    def test_two_term_model_has_no_audio_contribution_or_ablation(self):
+        from analyze_ravdess_results import (analyze_modality_contributions, CONDITIONS,
+                                            EMOTIONS, write_csv, read_csv, contribution_arrays)
+        rows = self.make_rows()
+        for row in rows:
+            for emotion in EMOTIONS:
+                row['logit_' + emotion] -= row.pop('audio_logit_' + emotion)
+        logits, terms = contribution_arrays(rows)
+        self.assertEqual(terms.shape, (12, 2, 6))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for condition in CONDITIONS:
+                write_csv(root / ('test_predictions_' + condition + '.csv'), rows, list(rows[0]))
+            warnings = []
+            self.assertTrue(analyze_modality_contributions(root, root, 40, warnings))
+            folder = root / 'modality_contributions'
+            summary = read_csv(folder / 'contributions_by_emotion.csv')
+            self.assertEqual(len(summary), 36)
+            self.assertEqual({row['branch'] for row in summary}, {'video', 'interaction'})
+            for row in summary:
+                self.assertAlmostEqual(float(row['mean_margin']), -1. if row['branch'] == 'video' else .5)
+            ablations = read_csv(folder / 'term_ablation_accuracy.csv')
+            self.assertEqual(len(ablations), 90)
+            self.assertFalse(any('audio' in row['configuration'] for row in ablations))
+            self.assertFalse(warnings)
+
 
 if __name__ == '__main__':
     unittest.main()
