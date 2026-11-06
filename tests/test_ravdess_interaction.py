@@ -18,16 +18,27 @@ class DataTests(unittest.TestCase):
     def test_balanced_disjoint_reproducible(self):
         splits, report = balanced_split(self.rows, 42)
         self.assertEqual((splits, report), balanced_split(self.rows, 42))
-        self.assertEqual([len(splits[n]) for n in ('train', 'val', 'test')], [768, 192, 192])
-        groups = [{r['actor'] for r in splits[n]} for n in ('train', 'val', 'test')]
-        self.assertFalse(groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+        self.assertEqual(set(splits), {'train', 'test'})
+        self.assertEqual([len(splits[n]) for n in ('train', 'test')], [768, 384])
+        train_ids = {r['video'] for r in splits['train']}
+        test_ids = {r['video'] for r in splits['test']}
+        self.assertFalse(train_ids & test_ids)
+        self.assertEqual(len(train_ids | test_ids), 1152)
+        self.assertTrue(report['design']['shared_actors'])
+        self.assertEqual(report['train']['balanced_counts'], [128]*6)
+        self.assertEqual(report['test']['balanced_counts'], [64]*6)
+        self.assertNotEqual(splits, balanced_split(self.rows, 43)[0])
         for rows in splits.values():
             self.assertEqual(len({r['video'] for r in rows}), len(rows))
             self.assertEqual(len({sum(r['label'] == c for r in rows) for c in range(6)}), 1)
 
-    def test_invalid_actor_split(self):
+    def test_insufficient_trials_rejected(self):
         with self.assertRaises(ValueError):
-            balanced_split(self.rows, 42, [1, 2], [2, 3])
+            balanced_split(self.rows[1:], 42)
+
+    def test_duplicate_trials_rejected(self):
+        with self.assertRaises(ValueError):
+            balanced_split(self.rows + [self.rows[0]], 42)
 
     def test_pairing_and_missing_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
