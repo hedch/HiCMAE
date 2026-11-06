@@ -22,6 +22,8 @@ CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 NAMES = {'both': 'Audio + video', 'video_noise': 'Video + white noise',
          'audio_neutral': 'Audio + neutral face'}
 COLORS = {'both': '#2864B4', 'video_noise': '#D37B20', 'audio_neutral': '#23856B'}
+BRANCHES = ('video', 'audio', 'interaction')
+BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B'}
 
 
 def read_csv(path):
@@ -249,6 +251,135 @@ def aggregate_heatmaps(run, save, targets, dpi, warnings):
     return report
 
 
+def contribution_arrays(rows):
+    """Read recorded branch logits and verify exact reconstruction of model scores."""
+    logits = np.asarray([[float(row['logit_' + e]) for e in EMOTIONS] for row in rows])
+    terms = np.asarray([[[float(row[b + '_logit_' + e]) for e in EMOTIONS]
+                         for b in BRANCHES] for row in rows])  # trial, branch, class
+    if not np.isfinite(logits).all() or not np.isfinite(terms).all():
+        raise ValueError('Nonfinite modality contributions')
+    if not np.allclose(terms.sum(1), logits, rtol=1e-5, atol=1e-5):
+        raise ValueError('Saved branch contributions do not sum to the recorded logits')
+    return logits, terms
+
+
+def plot_contributions(rows, field, ylabel, title, path, dpi):
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=True)
+    x, width = np.arange(len(EMOTIONS)), .24
+    for ax, condition in zip(axes, CONDITIONS):
+        for i, branch in enumerate(BRANCHES):
+            values = [next(r[field] for r in rows if r['condition'] == condition
+                           and r['emotion'] == emotion and r['branch'] == branch) for emotion in EMOTIONS]
+            ax.bar(x+(i-1)*width, values, width, label=branch.capitalize(), color=BRANCH_COLORS[branch])
+        ax.axhline(0, color='.3', linewidth=.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([e.capitalize() for e in EMOTIONS], rotation=35, ha='right')
+        ax.set_title(NAMES[condition])
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.grid(axis='y', alpha=.2)
+        ax.set_axisbelow(True)
+    axes[0].set_ylabel(ylabel)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', ncol=3, bbox_to_anchor=(.5, .97))
+    fig.suptitle(title, y=1.03)
+    fig.tight_layout(rect=(0, 0, 1, .89))
+    save_figure(fig, path, dpi)
+
+
+def analyze_modality_contributions(run, save, dpi, warnings):
+    """Describe feature-dependent contributions and frozen-logit term ablations.
+
+    The reference competitor is selected ONCE for each trial: the highest-scoring
+    wrong class under full audio+video. Keep this competitor fixed across branches
+    and test conditions so all margin decompositions compare the same two classes.
+    """
+    predictions = {c: read_csv(run / ('test_predictions_' + c + '.csv')) for c in CONDITIONS}
+    required = ['logit_' + e for e in EMOTIONS] + [b + '_logit_' + e for b in BRANCHES for e in EMOTIONS]
+    present = [all(key in row for key in required) for rows in predictions.values() for row in rows]
+    if not any(present):
+        warnings.append('No saved modality logits: contribution plots skipped. Retrain with the updated runner.')
+        return False
+    if not all(present):
+        raise ValueError('Some prediction rows lack modality-logit columns; do not mix output versions')
+    folder = save / 'modality_contributions'
+    folder.mkdir(exist_ok=True)
+    baseline_rows = predictions['both']
+    baseline_logits, _ = contribution_arrays(baseline_rows)
+    competitors = {}
+    for row, logits in zip(baseline_rows, baseline_logits):
+        target = int(row['label'])
+        wrong_scores = logits.copy()
+        wrong_scores[target] = -np.inf
+        competitors[row['video']] = int(wrong_scores.argmax())
+
+    trial_records, summaries, ablations = [], [], []
+    # These remove terms from the existing output. They do not retrain or replace inputs.
+    configurations = {'full': (0, 1, 2), 'drop_video': (1, 2),
+                      'drop_audio': (0, 2), 'drop_interaction': (0, 1),
+                      'video_term_only': (0,), 'audio_term_only': (1,),
+                      'interaction_term_only': (2,)}
+    for condition in CONDITIONS:
+        rows = predictions[condition]
+        logits, terms = contribution_arrays(rows)
+        labels = np.asarray([int(row['label']) for row in rows])
+        rival = np.asarray([competitors[row['video']] for row in rows])
+        ix = np.arange(len(rows))
+        true_terms = terms[ix, :, labels]
+        rival_terms = terms[ix, :, rival]
+        margins = true_terms - rival_terms
+        full_margin = logits[ix, labels] - logits[ix, rival]
+        if not np.allclose(margins.sum(1), full_margin, rtol=1e-5, atol=1e-5):
+            raise ValueError('Branch margins do not reconstruct the full margin')
+        magnitude = np.abs(margins).sum(1)
+        shares = np.divide(np.abs(margins), magnitude[:, None], out=np.zeros_like(margins),
+                           where=magnitude[:, None] > 0)
+        for i, row in enumerate(rows):
+            for bi, branch in enumerate(BRANCHES):
+                trial_records.append(dict(condition=condition, video=row['video'], actor=row.get('actor', ''),
+                    label=int(labels[i]), emotion=EMOTIONS[labels[i]], competitor=int(rival[i]),
+                    competitor_emotion=EMOTIONS[rival[i]], branch=branch,
+                    true_logit=float(true_terms[i, bi]), competitor_logit=float(rival_terms[i, bi]),
+                    margin=float(margins[i, bi]), full_margin=float(full_margin[i]),
+                    abs_margin_share=float(shares[i, bi]), zero_total_abs_margin=bool(magnitude[i] == 0),
+                    correct=bool(logits[i].argmax() == labels[i])))
+        for label, emotion in enumerate(EMOTIONS):
+            selected = labels == label
+            for bi, branch in enumerate(BRANCHES):
+                values = margins[selected, bi]
+                summaries.append(dict(condition=condition, label=label, emotion=emotion, branch=branch,
+                    n=int(selected.sum()), mean_true_logit=float(true_terms[selected, bi].mean()),
+                    mean_margin=float(values.mean()), mean_abs_margin=float(np.abs(values).mean()),
+                    fraction_positive_margin=float((values > 0).mean()),
+                    mean_abs_margin_share=float(shares[selected, bi].mean())))
+            full_correct = logits[selected].argmax(1) == labels[selected]
+            for name, included in configurations.items():
+                ablated_logits = terms[selected][:, included, :].sum(1)
+                correct = ablated_logits.argmax(1) == labels[selected]
+                ablations.append(dict(condition=condition, label=label, emotion=emotion, configuration=name,
+                    n=int(selected.sum()), correct=int(correct.sum()), accuracy=float(correct.mean()),
+                    accuracy_drop=float(full_correct.mean()-correct.mean())))
+    write_csv(folder / 'trial_contributions.csv', trial_records, list(trial_records[0]))
+    write_csv(folder / 'contributions_by_emotion.csv', summaries, list(summaries[0]))
+    write_csv(folder / 'term_ablation_accuracy.csv', ablations, list(ablations[0]))
+    plot_contributions(summaries, 'mean_true_logit', 'Mean contribution to true-class logit',
+                       'Raw score contributions by emotion', folder / 'true_logit_contributions', dpi)
+    plot_contributions(summaries, 'mean_margin', 'Mean signed contribution to class margin',
+                       'Discriminative contributions: true class minus fixed AV competitor',
+                       folder / 'margin_contributions', dpi)
+    plot_contributions(summaries, 'mean_abs_margin_share', 'Mean share of absolute margin magnitude',
+                       'Absolute contribution shares (direction of evidence is ignored)',
+                       folder / 'absolute_margin_shares', dpi)
+    ablation_plot = []
+    for row in ablations:
+        if row['configuration'] in ('drop_video', 'drop_audio', 'drop_interaction'):
+            ablation_plot.append(dict(condition=row['condition'], emotion=row['emotion'],
+                                      branch=row['configuration'][5:], drop=100*row['accuracy_drop']))
+    plot_contributions(ablation_plot, 'drop', 'Accuracy drop (percentage points)',
+                       'Remove one logit term; positive values indicate reduced accuracy',
+                       folder / 'term_removal_accuracy_drop', dpi)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', required=True, help='Existing trained-run output folder')
@@ -273,10 +404,14 @@ def main():
     plot_epoch_curves(groups, save, checkpoint_epoch, args.dpi, warnings,
                       'Final epoch' if final_epoch else 'Best validation epoch')
     targets = analyze_predictions(run, save, args.dpi, description)
+    contributions_available = analyze_modality_contributions(run, save, args.dpi, warnings)
     counts = aggregate_heatmaps(run, save, targets, args.dpi, warnings)
     report = dict(run_dir=str(run), checkpoint_epoch=checkpoint_epoch,
                   checkpoint_selection=summary.get('checkpoint_selection', 'best_validation'), emotions=EMOTIONS,
                   conditions=NAMES, warnings=warnings, heatmap_counts=counts,
+                  contributions_available=contributions_available,
+                  contribution_competitor='Highest wrong-class logit under both; fixed across conditions',
+                  contribution_interpretation='Descriptive model-score decomposition; interaction is joint, not assigned to either modality',
                   heatmap_averaging='Positive native map / saved shared trial scale, averaged over tubelets then trials',
                   interpretation='Positive loss relevance; model-input coordinates without facial registration',
                   training_accuracy='Online training crops and changing within-epoch weights',
