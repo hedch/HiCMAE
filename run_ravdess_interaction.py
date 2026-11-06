@@ -269,7 +269,9 @@ def train(splits, args, output):
         with torch.set_grad_enabled(training):
             for v, a, y, indices in loader:
                 target = y.to(device)
-                logits = model(v.to(device), a.to(device))
+                logits, terms = model(v.to(device), a.to(device), return_terms=True)
+                # Terms come from this exact forward pass, including during training.
+                torch.testing.assert_close(logits, terms[0] + terms[1] + terms[2])
                 batch_losses = torch.nn.functional.cross_entropy(logits, target, reduction='none')
                 loss = batch_losses.mean()
                 if not torch.isfinite(loss):
@@ -282,15 +284,21 @@ def train(splits, args, output):
                 pred = logits.detach().argmax(1).cpu().tolist()
                 probs = logits.detach().softmax(1).cpu().tolist()
                 values = batch_losses.detach().cpu().tolist()
+                term_values = [term.detach().cpu().tolist() for term in terms]
+                logit_values = logits.detach().cpu().tolist()
                 labels.extend(y.tolist())
                 predictions.extend(pred)
                 losses.extend(values)
-                for index, label, prediction, value, probability in zip(indices.tolist(), y.tolist(), pred, values, probs):
+                for offset, (index, label, prediction, value, probability) in enumerate(
+                        zip(indices.tolist(), y.tolist(), pred, values, probs)):
                     row = loader.dataset.rows[index]
                     record = dict(video=row['video'], actor=row['actor'],
                                   neutral_video=row.get('neutral_video', ''), noise_seed=row.get('noise_seed', ''),
                                   label=label, prediction=prediction, correct=int(label == prediction), loss=value)
                     record.update(zip(['p_' + e for e in EMOTIONS], probability))
+                    record.update(zip(['logit_' + e for e in EMOTIONS], logit_values[offset]))
+                    for branch, branch_values in zip(('video', 'audio', 'interaction'), term_values):
+                        record.update(zip([branch + '_logit_' + e for e in EMOTIONS], branch_values[offset]))
                     records.append(record)
         metrics = dict(loss=float(np.mean(losses)), accuracy=float(accuracy_score(labels, predictions)),
                        correct=sum(y == p for y, p in zip(labels, predictions)), total=len(labels),
@@ -336,6 +344,11 @@ def train(splits, args, output):
     # Fixed final epoch: test monitoring never selects a checkpoint.
     torch.save(dict(model=model.state_dict(), args=vars(args), epoch=args.epochs,
                     emotions=EMOTIONS, checkpoint_selection='final_epoch'), output / 'final.pth')
+    np.savez_compressed(output / 'classifier_weights.npz',
+                        wv=model.wv.weight.detach().cpu().numpy(),
+                        wa=model.wa.weight.detach().cpu().numpy(),
+                        wf=model.wf.weight.detach().cpu().numpy(),
+                        emotions=np.asarray(EMOTIONS))
     summary = {}
     for condition in TEST_CONDITIONS:
         summary[condition], records = run_pass(loaders['test_' + condition])
