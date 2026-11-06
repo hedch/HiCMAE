@@ -61,39 +61,41 @@ def discover(video_root, audio_root):
     return rows
 
 
-def balanced_split(rows, seed, val_actors=None, test_actors=None):
-    actors = sorted({r['actor'] for r in rows})
-    if val_actors is None and test_actors is None:
-        if len(actors) != 24:
-            raise ValueError('Default split requires all 24 actors; otherwise specify both actor lists.')
-        random.Random(seed).shuffle(actors)
-        val_actors, test_actors = actors[16:20], actors[20:24]
-    if not val_actors or not test_actors:
-        raise ValueError('Specify both nonempty --val-actors and --test-actors.')
-    val, test = set(val_actors), set(test_actors)
-    train = set(actors) - val - test
-    if val & test or not (val | test) <= set(actors) or not train:
-        raise ValueError('Actor groups must be nonempty, present, and disjoint.')
-    result, report = {}, {}
-    for i, (name, group) in enumerate([('train', train), ('val', val), ('test', test)]):
-        buckets = [[r for r in rows if r['actor'] in group and r['label'] == c]
-                   for c in range(NUM_CLASSES)]
-        n = min(map(len, buckets))
-        if n == 0:
-            raise ValueError(f'{name}: at least one emotion is absent.')
-        rng = random.Random(seed + i)
-        selected = []
-        for bucket in buckets:
-            selected.extend(rng.sample(bucket, n))
-        rng.shuffle(selected)
-        result[name] = selected
-        report[name] = dict(actors=sorted(group), original_counts=[len(b) for b in buckets],
-                            balanced_counts=[n] * NUM_CLASSES, total=NUM_CLASSES * n)
+def balanced_split(rows, seed):
+    """Mix actors; independently shuffle each emotion into 128 train / 64 test trials."""
+    rng = random.Random(seed)
+    result, report = {'train': [], 'test': []}, {}
+    original_counts = []
+    for label, emotion in enumerate(EMOTIONS):
+        bucket = sorted([row for row in rows if row['label'] == label], key=lambda r: r['video'])
+        if len({row['video'] for row in bucket}) != len(bucket):
+            raise ValueError('Duplicate emotional trial in ' + emotion)
+        original_counts.append(len(bucket))
+        if len(bucket) < 192:
+            raise ValueError('%s has %d trials; exactly 128 training + 64 testing requires at least 192.'
+                             % (emotion, len(bucket)))
+        rng.shuffle(bucket)
+        result['train'].extend(dict(row) for row in bucket[:128])
+        result['test'].extend(dict(row) for row in bucket[128:192])
+    train_ids = {row['video'] for row in result['train']}
+    test_ids = {row['video'] for row in result['test']}
+    if train_ids & test_ids:
+        raise ValueError('A trial occurs in both training and testing')
+    for name, n in [('train', 128), ('test', 64)]:
+        rng.shuffle(result[name])
+        report[name] = dict(actors=sorted({row['actor'] for row in result[name]}),
+                            balanced_counts=[n] * NUM_CLASSES, total=n * NUM_CLASSES)
+    report['design'] = dict(method='mixed_actor_trial_split', seed=seed,
+                            original_counts=original_counts,
+                            unused_counts=[n-192 for n in original_counts],
+                            shared_actors=sorted({r['actor'] for r in result['train']} &
+                                                 {r['actor'] for r in result['test']}),
+                            validation=False, checkpoint_selection='final_epoch')
     return result, report
 
 
 def attach_test_controls(splits, rows, seed):
-    """Use same-actor, same-statement/repetition neutral faces from test actors only."""
+    """Use neutral controls matched on actor, statement and repetition; controls are not training targets."""
     references = {}
     for row in rows:
         if row['label'] == -1:
@@ -238,7 +240,7 @@ def make_loaders(splits, args):
         return DataLoader(PairedDataset(rows, training, condition), batch_size=args.batch_size,
                           shuffle=training, num_workers=0,
                           pin_memory=args.device.startswith('cuda'), drop_last=False)
-    loaders = dict(train=loader(splits['train'], training=True), val=loader(splits['val']))
+    loaders = dict(train=loader(splits['train'], training=True))
     for condition in TEST_CONDITIONS:
         loaders['test_' + condition] = loader(splits['test'], condition=condition)
     return loaders
@@ -315,40 +317,34 @@ def train(splits, args, output):
                                  **{k: metrics[k] for k in fields if k in metrics}))
         save_predictions(prediction_dir / ('%s_epoch_%03d.csv' % (name, epoch)), records)
 
-    best = -1.0
     for epoch in range(args.epochs):
         learning_rate = optimizer.param_groups[0]['lr']
         train_metrics, train_records = run_pass(loaders['train'], training=True)
-        metrics, val_records = run_pass(loaders['val'])
         save_epoch(epoch+1, 'train', train_metrics, train_records, learning_rate)
-        save_epoch(epoch+1, 'val', metrics, val_records, learning_rate)
-        # Checkpoint selection uses validation ONLY, irrespective of monitored test results.
-        if metrics['uar'] > best:
-            best = metrics['uar']
-            torch.save(dict(model=model.state_dict(), args=vars(args), epoch=epoch+1,
-                            emotions=EMOTIONS, val=metrics), output / 'best.pth')
         tests = {}
         if not args.skip_epoch_tests:
             for condition in TEST_CONDITIONS:
                 name = 'test_' + condition
                 tests[condition], records = run_pass(loaders[name])
                 save_epoch(epoch+1, name, tests[condition], records, learning_rate)
-        record = dict(epoch=epoch+1, train=train_metrics, val=metrics, tests=tests,
+        record = dict(epoch=epoch+1, train=train_metrics, tests=tests,
                       learning_rate=learning_rate)
         print(json.dumps(record), flush=True)
         with (output / 'history.jsonl').open('a') as f:
             f.write(json.dumps(record) + '\n')
         scheduler.step()
-    best_state = torch.load(output / 'best.pth', map_location=device)
-    model.load_state_dict(best_state['model'])
+    # Fixed final epoch: test monitoring never selects a checkpoint.
+    torch.save(dict(model=model.state_dict(), args=vars(args), epoch=args.epochs,
+                    emotions=EMOTIONS, checkpoint_selection='final_epoch'), output / 'final.pth')
     summary = {}
     for condition in TEST_CONDITIONS:
         summary[condition], records = run_pass(loaders['test_' + condition])
         (output / f'test_metrics_{condition}.json').write_text(json.dumps(summary[condition], indent=2))
         save_predictions(output / f'test_predictions_{condition}.csv', records)
     (output / 'test_metrics.json').write_text(json.dumps(
-        dict(emotions=EMOTIONS, best_epoch=best_state['epoch'], conditions=summary), indent=2))
-    print('Best-validation checkpoint test results:', json.dumps(summary))
+        dict(emotions=EMOTIONS, checkpoint_epoch=args.epochs, checkpoint_file='final.pth',
+             checkpoint_selection='final_epoch', conditions=summary), indent=2))
+    print('Final-epoch checkpoint test results:', json.dumps(summary))
     if not args.skip_explanations:
         from video_loss_explanations import export_test_explanations
         export_test_explanations(model, loaders, splits['test'], TEST_CONDITIONS,
@@ -362,8 +358,6 @@ def main():
     parser.add_argument('--checkpoint')
     parser.add_argument('--output-dir', default='runs/ravdess_interaction')
     parser.add_argument('--prepare-only', action='store_true')
-    parser.add_argument('--val-actors', type=int, nargs='+')
-    parser.add_argument('--test-actors', type=int, nargs='+')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--embed-dim', type=int, choices=[384, 512], default=512)
     parser.add_argument('--depth', type=int, default=10)
@@ -392,11 +386,11 @@ def main():
     if output.exists() and any(output.iterdir()):
         parser.error('Use a new/empty output directory to avoid overwriting an experiment')
     rows = discover(args.video_root, args.audio_root)
-    splits, report = balanced_split(rows, args.seed, args.val_actors, args.test_actors)
+    splits, report = balanced_split(rows, args.seed)
     attach_test_controls(splits, rows, args.seed)
     output.mkdir(parents=True, exist_ok=True)
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
-    (output / 'split_report.json').write_text(json.dumps(dict(emotions=EMOTIONS, splits=report), indent=2))
+    (output / 'split_report.json').write_text(json.dumps(dict(emotions=EMOTIONS, split_method='mixed_actor_trial_split', splits=report), indent=2))
     for name, rows in splits.items():
         with (output / f'{name}.csv').open('w', newline='') as f:
             fields = ['video', 'audio', 'label', 'actor']
