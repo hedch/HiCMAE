@@ -58,6 +58,8 @@ def load_epochs(run):
                         rows.append(dict(epoch=record['epoch'], split=name, **record[name]))
                 for name, metrics in record.get('tests', {}).items():
                     rows.append(dict(epoch=record['epoch'], split='test_' + name, **metrics))
+                for name, metrics in record.get('train_conditions', {}).items():
+                    rows.append(dict(epoch=record['epoch'], split='train_' + name, **metrics))
     groups, seen = defaultdict(list), set()
     for row in rows:
         name, epoch = row['split'], int(row['epoch'])
@@ -83,6 +85,10 @@ def plot_epoch_curves(groups, save, best_epoch, dpi, warnings, checkpoint_label=
     if not groups.get('val'):
         specifications[0] = ('training_accuracy', [('train', 'Training (online)', '#2864B4')],
                              'Training accuracy — no validation split')
+    if any(groups.get('train_' + c) for c in CONDITIONS):
+        specifications.append(('training_accuracy_conditions',
+                               [('train_' + c, NAMES[c], COLORS[c]) for c in CONDITIONS],
+                               'Training accuracy by input condition (online)'))
     for filename, curves, title in specifications:
         fig, ax = plt.subplots(figsize=(8.5, 5))
         plotted = 0
