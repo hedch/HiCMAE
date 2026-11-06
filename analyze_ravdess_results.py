@@ -257,11 +257,22 @@ def aggregate_heatmaps(run, save, targets, dpi, warnings):
     return report
 
 
-def contribution_arrays(rows):
+def recorded_branches(rows):
+    """New two-term runs omit audio columns; old three-term runs retain them."""
+    if not rows:
+        raise ValueError('No prediction rows')
+    branches = tuple(b for b in BRANCHES if all(b + '_logit_' + e in rows[0] for e in EMOTIONS))
+    if 'video' not in branches or 'interaction' not in branches:
+        raise ValueError('Missing video or interaction logit columns')
+    return branches
+
+
+def contribution_arrays(rows, branches=None):
     """Read recorded branch logits and verify exact reconstruction of model scores."""
+    branches = recorded_branches(rows) if branches is None else branches
     logits = np.asarray([[float(row['logit_' + e]) for e in EMOTIONS] for row in rows])
     terms = np.asarray([[[float(row[b + '_logit_' + e]) for e in EMOTIONS]
-                         for b in BRANCHES] for row in rows])  # trial, branch, class
+                         for b in branches] for row in rows])  # trial, branch, class
     if not np.isfinite(logits).all() or not np.isfinite(terms).all():
         raise ValueError('Nonfinite modality contributions')
     if not np.allclose(terms.sum(1), logits, rtol=1e-5, atol=1e-5):
@@ -271,12 +282,14 @@ def contribution_arrays(rows):
 
 def plot_contributions(rows, field, ylabel, title, path, dpi):
     fig, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=True)
-    x, width = np.arange(len(EMOTIONS)), .24
+    branches = tuple(b for b in BRANCHES if any(row['branch'] == b for row in rows))
+    x, width = np.arange(len(EMOTIONS)), .8 / len(branches)
     for ax, condition in zip(axes, CONDITIONS):
-        for i, branch in enumerate(BRANCHES):
+        for i, branch in enumerate(branches):
             values = [next(r[field] for r in rows if r['condition'] == condition
                            and r['emotion'] == emotion and r['branch'] == branch) for emotion in EMOTIONS]
-            ax.bar(x+(i-1)*width, values, width, label=branch.capitalize(), color=BRANCH_COLORS[branch])
+            ax.bar(x+(i-(len(branches)-1)/2)*width, values, width,
+                   label=branch.capitalize(), color=BRANCH_COLORS[branch])
         ax.axhline(0, color='.3', linewidth=.8)
         ax.set_xticks(x)
         ax.set_xticklabels([e.capitalize() for e in EMOTIONS], rotation=35, ha='right')
@@ -300,7 +313,14 @@ def analyze_modality_contributions(run, save, dpi, warnings):
     and test conditions so all margin decompositions compare the same two classes.
     """
     predictions = {c: read_csv(run / ('test_predictions_' + c + '.csv')) for c in CONDITIONS}
-    required = ['logit_' + e for e in EMOTIONS] + [b + '_logit_' + e for b in BRANCHES for e in EMOTIONS]
+    any_terms = any(any('_logit_' in key for key in row) for rows in predictions.values() for row in rows)
+    if not any_terms:
+        warnings.append('No saved modality logits: contribution plots skipped. Retrain with the updated runner.')
+        return False
+    branches = recorded_branches(predictions['both'])
+    if any(recorded_branches(rows) != branches for rows in predictions.values()):
+        raise ValueError('Conditions have incompatible logit terms; do not mix model versions')
+    required = ['logit_' + e for e in EMOTIONS] + [b + '_logit_' + e for b in branches for e in EMOTIONS]
     present = [all(key in row for key in required) for rows in predictions.values() for row in rows]
     if not any(present):
         warnings.append('No saved modality logits: contribution plots skipped. Retrain with the updated runner.')
@@ -320,13 +340,13 @@ def analyze_modality_contributions(run, save, dpi, warnings):
 
     trial_records, summaries, ablations = [], [], []
     # These remove terms from the existing output. They do not retrain or replace inputs.
-    configurations = {'full': (0, 1, 2), 'drop_video': (1, 2),
-                      'drop_audio': (0, 2), 'drop_interaction': (0, 1),
-                      'video_term_only': (0,), 'audio_term_only': (1,),
-                      'interaction_term_only': (2,)}
+    configurations = {'full': tuple(range(len(branches)))}
+    for i, branch in enumerate(branches):
+        configurations['drop_' + branch] = tuple(j for j in range(len(branches)) if j != i)
+        configurations[branch + '_term_only'] = (i,)
     for condition in CONDITIONS:
         rows = predictions[condition]
-        logits, terms = contribution_arrays(rows)
+        logits, terms = contribution_arrays(rows, branches)
         labels = np.asarray([int(row['label']) for row in rows])
         rival = np.asarray([competitors[row['video']] for row in rows])
         ix = np.arange(len(rows))
@@ -340,7 +360,7 @@ def analyze_modality_contributions(run, save, dpi, warnings):
         shares = np.divide(np.abs(margins), magnitude[:, None], out=np.zeros_like(margins),
                            where=magnitude[:, None] > 0)
         for i, row in enumerate(rows):
-            for bi, branch in enumerate(BRANCHES):
+            for bi, branch in enumerate(branches):
                 trial_records.append(dict(condition=condition, video=row['video'], actor=row.get('actor', ''),
                     label=int(labels[i]), emotion=EMOTIONS[labels[i]], competitor=int(rival[i]),
                     competitor_emotion=EMOTIONS[rival[i]], branch=branch,
@@ -350,7 +370,7 @@ def analyze_modality_contributions(run, save, dpi, warnings):
                     correct=bool(logits[i].argmax() == labels[i])))
         for label, emotion in enumerate(EMOTIONS):
             selected = labels == label
-            for bi, branch in enumerate(BRANCHES):
+            for bi, branch in enumerate(branches):
                 values = margins[selected, bi]
                 summaries.append(dict(condition=condition, label=label, emotion=emotion, branch=branch,
                     n=int(selected.sum()), mean_true_logit=float(true_terms[selected, bi].mean()),
