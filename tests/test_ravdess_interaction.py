@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from run_ravdess_interaction import (balanced_split, discover, make_model,
-                                     attach_test_controls, white_noise, EMOTION_CODES)
+                                     attach_test_controls, white_noise, EMOTION_CODES,
+                                     expand_training_rows, TEST_CONDITIONS)
 
 
 class DataTests(unittest.TestCase):
@@ -39,6 +40,27 @@ class DataTests(unittest.TestCase):
     def test_duplicate_trials_rejected(self):
         with self.assertRaises(ValueError):
             balanced_split(self.rows + [self.rows[0]], 42)
+
+    def test_expand_only_training_trials_and_equal_conditions(self):
+        splits, _ = balanced_split(self.rows, 42)
+        expanded = expand_training_rows(splits['train'])
+        self.assertEqual(len(expanded), 2304)
+        test_ids = {row['video'] for row in splits['test']}
+        self.assertFalse({row['video'] for row in expanded} & test_ids)
+        for condition in TEST_CONDITIONS:
+            subset = [row for row in expanded if row['condition'] == condition]
+            self.assertEqual(len(subset), 768)
+            self.assertEqual([sum(r['label'] == label for r in subset) for label in range(6)], [128]*6)
+        for trial in splits['train']:
+            self.assertEqual({r['condition'] for r in expanded if r['video'] == trial['video']}, set(TEST_CONDITIONS))
+
+    def test_controls_attached_to_training_and_test_with_separate_noise_seeds(self):
+        splits = {'train': [dict(actor=23, label=0, video='02-01-03-02-02-01-23.mp4')],
+                  'test': [dict(actor=23, label=0, video='02-01-03-01-02-01-23.mp4')]}
+        refs = [dict(actor=23, label=-1, video='02-01-01-01-02-01-23.mp4')]
+        attach_test_controls(splits, refs, 42)
+        self.assertEqual(splits['train'][0]['neutral_video'], refs[0]['video'])
+        self.assertNotEqual(splits['train'][0]['noise_seed'], splits['test'][0]['noise_seed'])
 
     def test_pairing_and_missing_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
