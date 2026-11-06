@@ -30,10 +30,10 @@ class EpochOutputsTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.wv = torch.nn.Linear(6, 6, bias=False)
-                self.wa = torch.nn.Linear(6, 6, bias=False)
                 self.wf = torch.nn.Linear(6, 6, bias=False)
+                self.logit_terms = ('video', 'interaction')
             def forward(self, v, a, return_terms=False):
-                terms = (self.wv(v), self.wa(a), self.wf(v*a))
+                terms = (self.wv(v), self.wf(v*a))
                 logits = sum(terms)
                 return (logits, terms) if return_terms else logits
 
@@ -59,6 +59,9 @@ class EpochOutputsTests(unittest.TestCase):
                     self.assertEqual(int(row['total']), 6)
             self.assertTrue((output / 'final.pth').exists())
             self.assertTrue((output / 'classifier_weights.npz').exists())
+            import numpy as np
+            with np.load(output / 'classifier_weights.npz') as weights:
+                self.assertNotIn('wa', weights.files)
             self.assertFalse((output / 'best.pth').exists())
             self.assertFalse(any(row['split'] == 'val' for row in metrics))
             for row in metrics:
@@ -75,7 +78,8 @@ class EpochOutputsTests(unittest.TestCase):
                 for row in rows:
                     self.assertEqual(int(row['correct']), int(row['label'] == row['prediction']))
                     for emotion in experiment.EMOTIONS:
-                        total = sum(float(row[b + '_logit_' + emotion]) for b in ('video', 'audio', 'interaction'))
+                        self.assertNotIn('audio_logit_' + emotion, row)
+                        total = sum(float(row[b + '_logit_' + emotion]) for b in ('video', 'interaction'))
                         self.assertAlmostEqual(total, float(row['logit_' + emotion]), places=5)
 
 
