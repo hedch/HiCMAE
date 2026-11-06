@@ -35,7 +35,7 @@ mean-pooled over tokens and combined across layers with learned softmax weights.
 The B x D pooled vectors feed independent bias-free D-to-6 linear maps:
 
 ```
-logits = wv(ov) + wa(oa) + wf(ov * oa)
+logits = wv(ov) + wf(ov * oa)
 ```
 
 The product is elementwise. Both encoders train with a shuffled mixture of paired emotional audio/video,
@@ -106,8 +106,8 @@ The new runner does not create `best.pth` or `val.csv`.
 | video_noise | Original emotional clip | Seeded Gaussian white noise |
 | audio_neutral | Static neutral face repeated 16 times | Original speech |
 
-The same 384 test trials, labels and ordering are used in each condition. All
-three terms in the classifier stay active. White noise is generated in waveform
+The same 384 test trials, labels and ordering are used in each condition. Both
+terms in the classifier stay active; audio enters through the interaction only. White noise is generated in waveform
 space before audio preprocessing; `--noise-rms` defaults to 0.05, fixed across
 trials, with seeds saved per trial. Neutral clips match the actor, statement and
 repetition of the emotional trial. The midpoint frame is repeated. These controls
@@ -192,51 +192,50 @@ emotion, no validation, no overlapping trials, all actors mixed, controls matche
 Analysis was checked with synthetic known results. Full training/attribution checks
 require PyTorch and real data, unavailable in the editing environment.
 
-## Modality contributions recorded during retraining
+## Current two-term classifier and modality contributions
 
-The runner now calls the model with `return_terms=True` and records the actual
-feature-dependent video, audio, and interaction logits for every class. These are
-saved in both epoch prediction CSVs and final test prediction CSVs as
-`video_logit_{emotion}`, `audio_logit_{emotion}`, `interaction_logit_{emotion}`,
-and total `logit_{emotion}`. The runner checks the terms sum to the total. No
-additional forward pass or inference is required for the analysis. Final weight
-matrices are also saved in `classifier_weights.npz` (wv, wa, wf and class order),
-but weight magnitudes alone are not treated as modality reliance.
+The current model REMOVES the independent `wa(oa)` term. New runs have only
+`wv(ov) + wf(ov * oa)`: a direct video term and a joint audio-video interaction.
+There is no trainable audio-only output head. The audio encoder remains trainable
+through the interaction. Training/test input conditions remain the same, including
+emotional audio with a neutral face; in that condition audio changes the
+interaction with the neutral-face representation. The independent video term
+can provide a constant offset for a fixed neutral input.
 
-The same single `analyze_ravdess_results.py` script automatically adds a
-`modality_contributions/` output folder containing:
+New run configuration, checkpoint summaries and weight archives identify
+`logit_terms = [video, interaction]`. Prediction CSVs record total `logit_{emotion}`,
+`video_logit_{emotion}` and `interaction_logit_{emotion}` for all six emotions.
+The runner checks their sum reconstructs the total. `classifier_weights.npz`
+contains wv and wf, with no wa. Fine-tuning from the original pretrained checkpoint
+still loads encoder weights and initializes the two new output heads.
 
-- `true_logit_contributions.png/.pdf`: mean contributions to the true emotion's score.
-- `margin_contributions.png/.pdf`: signed contributions to the true-versus-competitor margin.
-- `absolute_margin_shares.png/.pdf`: mean fractional shares of absolute margin magnitude.
-- `term_removal_accuracy_drop.png/.pdf`: accuracy change when one score term is removed.
-- `trial_contributions.csv`, `contributions_by_emotion.csv`, and `term_ablation_accuracy.csv`.
+The same analysis script automatically detects two-term versus older three-term
+CSVs and creates `modality_contributions/` with four figures (PNG/PDF): raw
+true-class logit contributions, signed true-versus-competitor margins, absolute
+margin shares, and accuracy changes when a score term is removed. Trial and
+emotion-level contributions and term-ablation accuracies are saved as CSVs.
+For new runs the plots show ONLY video and interaction; no fictitious audio term
+or audio-term ablation is reported. Older results retain their actual three terms.
 
-All summaries use final-epoch test outputs and group by true emotion, separately
-for all three testing conditions. Every trial is included, whether correctly
-classified or not. The competing emotion is chosen once per trial as the highest
-wrong-class score under the original audio+video condition; it stays fixed across
-branches and conditions. This makes each three-term margin decomposition exact
-and comparable across conditions. Positive margins support the true class over
-that competitor; negative margins support the competitor. Means may cancel opposing
-contributions, so mean absolute magnitudes and positive fractions are saved too.
-Absolute shares ignore direction and are not probabilities of reliance. All-zero
-margins receive zero shares and are flagged at trial level.
+The competitor is the highest-scoring wrong class under original audio+video,
+chosen once per trial and fixed across branches and conditions. Contributions sum
+exactly to the true-minus-competitor margin. Positive values support the true class
+over that competitor; negative values support the competitor. Mean absolute values
+and positive fractions accompany signed averages. Absolute shares ignore direction
+and are not probabilities of reliance. Zero-magnitude margins get zero shares and
+are flagged. All test trials, correct and incorrect, contribute to the summaries.
 
-Term ablations recompute predictions by omitting selected recorded score terms,
-without changing features or retraining. The CSV also includes full scores and
-video-only, audio-only, and interaction-only score predictions. Dropping the video
-term still leaves visual information in the interaction; it is not a complete
-video-modality removal. Likewise for audio. A positive accuracy drop means omission
-hurt performance; negative values mean it improved performance. These describe
-the trained model's behavior, not human emotion processing or causal attribution
-to individual input pixels. The existing three-condition accuracy plots remain
-the input-replacement comparison.
+Term removal omits recorded score terms without retraining or replacing inputs.
+The new two-term model also reports video-term-only and interaction-term-only scores.
+Dropping the direct video term still leaves video information in the interaction.
+Dropping the interaction removes the model's only audio-dependent path. Positive
+accuracy drop means omission hurt performance; negative drop means it helped.
+These describe model behavior, not human modality reliance or causal pixel effects.
 
-No additional analysis command is needed. Older CSVs without the new columns still
-produce the existing plots and a clear warning that contribution analyses were
-skipped. Use a new output directory for retraining to obtain the contribution data.
-
+Use a NEW output directory and retrain for the new architecture. No new parameters
+are needed. Existing checkpoints/results are not rewritten. Explanation-only reruns
+inspect old saved checkpoints and reconstruct their original three-term head when
+needed, so old runs are not silently interpreted as the new two-term model.
 
 ## Expanded three-condition training
 
