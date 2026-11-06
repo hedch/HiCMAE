@@ -32,7 +32,7 @@ class EpochOutputsTests(unittest.TestCase):
 
         dataset = Dataset()
         loaders = {name: torch.utils.data.DataLoader(dataset, batch_size=3)
-                   for name in ['train', 'val', 'test_both', 'test_video_noise', 'test_audio_neutral']}
+                   for name in ['train', 'test_both', 'test_video_noise', 'test_audio_neutral']}
         args = SimpleNamespace(seed=42, device='cpu', checkpoint='unused', lr=.001,
                                epochs=2, skip_epoch_tests=False, skip_explanations=True)
         with tempfile.TemporaryDirectory() as temporary:
@@ -40,15 +40,19 @@ class EpochOutputsTests(unittest.TestCase):
             with patch.object(experiment, 'make_model', return_value=Model()), \
                  patch.object(experiment, 'load_pretrained'), \
                  patch.object(experiment, 'make_loaders', return_value=loaders):
-                experiment.train({name: dataset.rows for name in ('train', 'val', 'test')}, args, output)
+                experiment.train({name: dataset.rows for name in ('train', 'test')}, args, output)
             with (output / 'epoch_metrics.csv').open() as f:
                 metrics = list(csv.DictReader(f))
-            self.assertEqual(len(metrics), 10)
+            self.assertEqual(len(metrics), 8)
+            self.assertTrue((output / 'final.pth').exists())
+            self.assertFalse((output / 'best.pth').exists())
+            self.assertFalse(any(row['split'] == 'val' for row in metrics))
             for row in metrics:
                 self.assertAlmostEqual(float(row['accuracy']), int(row['correct']) / int(row['total']))
-            self.assertEqual(len(list((output / 'epoch_predictions').glob('*.csv'))), 10)
+            self.assertEqual(len(list((output / 'epoch_predictions').glob('*.csv'))), 8)
             summary = json.loads((output / 'test_metrics.json').read_text())
-            self.assertIn(summary['best_epoch'], (1, 2))
+            self.assertEqual(summary['checkpoint_epoch'], 2)
+            self.assertEqual(summary['checkpoint_selection'], 'final_epoch')
             self.assertEqual(set(summary['conditions']), set(experiment.TEST_CONDITIONS))
             for condition in experiment.TEST_CONDITIONS:
                 with (output / ('test_predictions_' + condition + '.csv')).open() as f:
