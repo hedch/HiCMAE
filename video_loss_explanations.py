@@ -207,6 +207,8 @@ def main():
         checkpoint_path = output / 'best.pth'  # Backward-compatible old actor-split run.
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     print('Loading explanation checkpoint:', checkpoint_path)
+    args.logit_terms = (['video', 'audio', 'interaction'] if 'wa.weight' in checkpoint['model']
+                        else ['video', 'interaction'])
     model = make_model(args)
     model.load_state_dict(checkpoint['model'], strict=True)
     model.to(options.device).eval()
