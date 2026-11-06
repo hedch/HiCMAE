@@ -194,7 +194,7 @@ def main():
     config.update(device=options.device, explain_limit=options.explain_limit)
     args = SimpleNamespace(**config)
     splits = {}
-    for name in ('train', 'val', 'test'):
+    for name in ('train', 'test'):
         with (output / (name + '.csv')).open(newline='') as f:
             rows = list(csv.DictReader(f))
         for row in rows:
@@ -202,7 +202,11 @@ def main():
                 if key in row and row[key] != '':
                     row[key] = int(row[key])
         splits[name] = rows
-    checkpoint = torch.load(output / 'best.pth', map_location='cpu')
+    checkpoint_path = output / 'final.pth'
+    if not checkpoint_path.exists():
+        checkpoint_path = output / 'best.pth'  # Backward-compatible old actor-split run.
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    print('Loading explanation checkpoint:', checkpoint_path)
     model = make_model(args)
     model.load_state_dict(checkpoint['model'], strict=True)
     model.to(options.device).eval()
