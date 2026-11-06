@@ -95,7 +95,7 @@ def balanced_split(rows, seed):
 
 
 def attach_test_controls(splits, rows, seed):
-    """Use neutral controls matched on actor, statement and repetition; controls are not training targets."""
+    """Attach neutral references and disjoint noise seeds to train/test base trials."""
     references = {}
     for row in rows:
         if row['label'] == -1:
@@ -104,13 +104,19 @@ def attach_test_controls(splits, rows, seed):
             if key in references:
                 raise ValueError(f'Duplicate neutral reference: {key}')
             references[key] = row['video']
-    for i, row in enumerate(splits['test']):
-        parts = Path(row['video']).stem.split('-')
-        key = (row['actor'], parts[4], parts[5])
-        if key not in references:
-            raise ValueError(f'Missing neutral speech video for test actor/statement/repetition {key}')
-        row['neutral_video'] = references[key]
-        row['noise_seed'] = seed + 100000 + i
+    for name, offset in [('train', 0), ('test', 100000)]:
+        for i, row in enumerate(splits.get(name, [])):
+            parts = Path(row['video']).stem.split('-')
+            key = (row['actor'], parts[4], parts[5])
+            if key not in references:
+                raise ValueError(f'Missing neutral speech video for {name} actor/statement/repetition {key}')
+            row['neutral_video'] = references[key]
+            row['noise_seed'] = seed + offset + i
+
+
+def expand_training_rows(rows):
+    """Each training trial appears once under each condition; loader shuffles all rows."""
+    return [dict(row, condition=condition) for row in rows for condition in TEST_CONDITIONS]
 
 
 def white_noise(num_samples, seed, rms):
@@ -189,12 +195,14 @@ def make_loaders(splits, args):
     class PairedDataset(Dataset):
         def __init__(self, rows, training, condition='both'):
             self.rows, self.training, self.condition = rows, training, condition
+            self.epoch = 0
 
         def __len__(self):
             return len(self.rows)
 
         def __getitem__(self, index):
             row = self.rows[index]
+            condition = row.get('condition', self.condition)
             vr = VideoReader(row['video'], ctx=cpu(0), num_threads=1)
             waveform, sr = torchaudio.load(row['audio'])
             waveform = waveform.mean(0, keepdim=True)
@@ -209,7 +217,7 @@ def make_loaders(splits, args):
             start = random.uniform(0, duration - span) if self.training else (duration - span) / 2
             times = start + np.arange(16) * span / 16
             indices = np.clip((times * fps).astype(int), 0, len(vr) - 1)
-            if self.condition == 'audio_neutral':
+            if condition == 'audio_neutral':
                 neutral = VideoReader(row['neutral_video'], ctx=cpu(0), num_threads=1)
                 # One neutral midpoint face repeated across 16 frames: no mouth-motion cue.
                 pixels = neutral.get_batch([len(neutral) // 2] * 16).asnumpy()
@@ -226,8 +234,9 @@ def make_loaders(splits, args):
             wave = waveform[:, int(start*16000):int((start+span)*16000)]
             wave = torch.nn.functional.pad(wave, (0, max(0, 40960-wave.shape[1])))[:, :40960]
             wave = wave - wave.mean()
-            if self.condition == 'video_noise':
-                wave = white_noise(40960, row['noise_seed'], args.noise_rms)
+            if condition == 'video_noise':
+                noise_seed = row['noise_seed'] + (self.epoch * 1000000 if self.training else 0)
+                wave = white_noise(40960, noise_seed, args.noise_rms)
             fb = torchaudio.compliance.kaldi.fbank(
                 wave, htk_compat=True, sample_frequency=16000, use_energy=False,
                 window_type='hanning', num_mel_bins=128, dither=0.0, frame_shift=10)
@@ -240,7 +249,7 @@ def make_loaders(splits, args):
         return DataLoader(PairedDataset(rows, training, condition), batch_size=args.batch_size,
                           shuffle=training, num_workers=0,
                           pin_memory=args.device.startswith('cuda'), drop_last=False)
-    loaders = dict(train=loader(splits['train'], training=True))
+    loaders = dict(train=loader(expand_training_rows(splits['train']), training=True))
     for condition in TEST_CONDITIONS:
         loaders['test_' + condition] = loader(splits['test'], condition=condition)
     return loaders
@@ -292,8 +301,12 @@ def train(splits, args, output):
                 for offset, (index, label, prediction, value, probability) in enumerate(
                         zip(indices.tolist(), y.tolist(), pred, values, probs)):
                     row = loader.dataset.rows[index]
-                    record = dict(video=row['video'], actor=row['actor'],
-                                  neutral_video=row.get('neutral_video', ''), noise_seed=row.get('noise_seed', ''),
+                    condition = row.get('condition', loader.dataset.condition if hasattr(loader.dataset, 'condition') else 'both')
+                    noise_seed = row.get('noise_seed', '')
+                    if training and condition == 'video_noise' and noise_seed != '':
+                        noise_seed += getattr(loader.dataset, 'epoch', 0) * 1000000
+                    record = dict(video=row['video'], actor=row['actor'], condition=condition,
+                                  neutral_video=row.get('neutral_video', ''), noise_seed=noise_seed,
                                   label=label, prediction=prediction, correct=int(label == prediction), loss=value)
                     record.update(zip(['p_' + e for e in EMOTIONS], probability))
                     record.update(zip(['logit_' + e for e in EMOTIONS], logit_values[offset]))
@@ -327,15 +340,32 @@ def train(splits, args, output):
 
     for epoch in range(args.epochs):
         learning_rate = optimizer.param_groups[0]['lr']
+        loaders['train'].dataset.epoch = epoch
         train_metrics, train_records = run_pass(loaders['train'], training=True)
         save_epoch(epoch+1, 'train', train_metrics, train_records, learning_rate)
+        training_conditions = {}
+        for condition in TEST_CONDITIONS:
+            subset = [row for row in train_records if row['condition'] == condition]
+            if not subset:
+                continue
+            true = [row['label'] for row in subset]
+            pred = [row['prediction'] for row in subset]
+            condition_metrics = dict(
+                loss=float(np.mean([row['loss'] for row in subset])),
+                accuracy=float(accuracy_score(true, pred)), correct=sum(row['correct'] for row in subset),
+                total=len(subset),
+                uar=float(recall_score(true, pred, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0)),
+                macro_f1=float(f1_score(true, pred, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0)),
+                confusion_matrix=confusion_matrix(true, pred, labels=list(range(NUM_CLASSES))).tolist())
+            training_conditions[condition] = condition_metrics
+            save_epoch(epoch+1, 'train_' + condition, condition_metrics, subset, learning_rate)
         tests = {}
         if not args.skip_epoch_tests:
             for condition in TEST_CONDITIONS:
                 name = 'test_' + condition
                 tests[condition], records = run_pass(loaders[name])
                 save_epoch(epoch+1, name, tests[condition], records, learning_rate)
-        record = dict(epoch=epoch+1, train=train_metrics, tests=tests,
+        record = dict(epoch=epoch+1, train=train_metrics, train_conditions=training_conditions, tests=tests,
                       learning_rate=learning_rate)
         print(json.dumps(record), flush=True)
         with (output / 'history.jsonl').open('a') as f:
@@ -387,6 +417,7 @@ def main():
     parser.add_argument('--explain-limit', type=int, default=0,
                         help='Explain first N test trials in each condition; 0 means all')
     args = parser.parse_args()
+    args.training_conditions = list(TEST_CONDITIONS)
     if args.explain_limit < 0:
         parser.error('--explain-limit must be nonnegative')
     if args.epochs < 1 or args.batch_size < 1 or args.depth < 1 or args.lr <= 0:
@@ -401,17 +432,25 @@ def main():
     rows = discover(args.video_root, args.audio_root)
     splits, report = balanced_split(rows, args.seed)
     attach_test_controls(splits, rows, args.seed)
+    expanded_train = expand_training_rows(splits['train'])
+    report['train_expanded'] = dict(total=len(expanded_train), conditions=list(TEST_CONDITIONS),
+                                   counts_per_condition={c: len(splits['train']) for c in TEST_CONDITIONS},
+                                   counts_per_emotion=[384] * NUM_CLASSES)
     output.mkdir(parents=True, exist_ok=True)
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
     (output / 'split_report.json').write_text(json.dumps(dict(emotions=EMOTIONS, split_method='mixed_actor_trial_split', splits=report), indent=2))
     for name, rows in splits.items():
         with (output / f'{name}.csv').open('w', newline='') as f:
             fields = ['video', 'audio', 'label', 'actor']
-            if name == 'test':
-                fields += ['neutral_video', 'noise_seed']
+            fields += ['neutral_video', 'noise_seed']
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
+    with (output / 'train_expanded.csv').open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['video', 'audio', 'label', 'actor',
+                                              'neutral_video', 'noise_seed', 'condition'])
+        writer.writeheader()
+        writer.writerows(expanded_train)
     print(json.dumps(report, indent=2))
     if not args.prepare_only:
         train(splits, args, output)
