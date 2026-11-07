@@ -148,6 +148,34 @@ class ModalityAnalysisTests(unittest.TestCase):
                     if n == 1:
                         self.assertFalse(any(r['configuration'].startswith('drop_') for r in ablations))
 
+    def test_all_interaction_term_selections(self):
+        import itertools
+        import numpy as np
+        from analyze_ravdess_results import (contribution_arrays, recorded_branches, EMOTIONS,
+                                            CONDITIONS, write_csv, read_csv, analyze_modality_contributions)
+        for count in range(1, 4):
+            for selected in itertools.combinations(('video', 'audio', 'interaction'), count):
+                rows = self.make_rows()
+                for row in rows:
+                    for emotion in EMOTIONS:
+                        row['logit_' + emotion] = sum(row[b + '_logit_' + emotion] for b in selected)
+                        for b in ('video', 'audio', 'interaction'):
+                            if b not in selected:
+                                del row[b + '_logit_' + emotion]
+                    row['prediction'] = int(np.argmax([row['logit_' + e] for e in EMOTIONS]))
+                self.assertEqual(recorded_branches(rows), selected)
+                logits, terms = contribution_arrays(rows)
+                np.testing.assert_allclose(logits, terms.sum(1))
+                if selected != ('interaction',):
+                    continue
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    for condition in CONDITIONS:
+                        write_csv(root / ('test_predictions_' + condition + '.csv'), rows, list(rows[0]))
+                    self.assertTrue(analyze_modality_contributions(root, root, 40, []))
+                    ablations = read_csv(root / 'modality_contributions' / 'term_ablation_accuracy.csv')
+                    self.assertFalse(any(r['configuration'].startswith('drop_') for r in ablations))
+
 
 if __name__ == '__main__':
     unittest.main()
