@@ -2,12 +2,23 @@ import importlib.util
 import random
 import tempfile
 import unittest
+import itertools
 from pathlib import Path
 from types import SimpleNamespace
 
 from run_ravdess_interaction import (balanced_split, discover, make_model,
                                      attach_test_controls, white_noise, EMOTION_CODES,
                                      expand_training_rows, TEST_CONDITIONS)
+
+
+class TermSelectionTests(unittest.TestCase):
+    def test_alias_order_and_invalid_terms(self):
+        from run_ravdess_interaction import normalize_terms
+        self.assertEqual(normalize_terms(['interaction', 'visual', 'audio']),
+                         ('video', 'audio', 'interaction'))
+        for names in ([], ['visual', 'video'], ['audio', 'audio'], ['fusion_video']):
+            with self.assertRaises(ValueError):
+                normalize_terms(names)
 
 
 class DataTests(unittest.TestCase):
@@ -122,6 +133,51 @@ class DataTests(unittest.TestCase):
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('torch', 'timm', 'einops')),
                      'Requires upstream model dependencies')
 class ModelTests(unittest.TestCase):
+    def test_every_term_combination(self):
+        import torch
+        from unittest.mock import patch
+        from run_ravdess_interaction import INTERACTION_TERMS
+        from video_loss_explanations import explain_video_loss
+        nn = torch.nn
+
+        class Encoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(1, 3, 1, 384))
+                self.blocks = nn.ModuleList([])
+                self.patch_embed = SimpleNamespace(tubelet_size=2, patch_size=(16, 16))
+            def forward(self, x):
+                return self.weight.expand(x.shape[0], -1, -1, -1)
+
+        def backbone(**kwargs):
+            return SimpleNamespace(encoder=Encoder(), encoder_audio=Encoder(),
+                                   video_layer_weights=nn.Parameter(torch.ones(1)),
+                                   audio_layer_weights=nn.Parameter(torch.ones(1)))
+
+        for count in range(1, 4):
+            for selected in itertools.combinations(INTERACTION_TERMS, count):
+                args = SimpleNamespace(embed_dim=384, depth=1, drop_path=0., logit_terms=selected)
+                with patch('modeling_finetune_av.AudioVisionTransformer', side_effect=backbone):
+                    model = make_model(args).eval()
+                logits, terms = model(torch.ones(2, 1), torch.ones(2, 1), return_terms=True)
+                v = model.encoder.weight.mean(1).squeeze(1).expand(2, -1)
+                a = model.encoder_audio.weight.mean(1).squeeze(1).expand(2, -1)
+                expected = []
+                for term, attr, feature in (('video', 'wv', v), ('audio', 'wa', a), ('interaction', 'wf', v*a)):
+                    self.assertEqual(hasattr(model, attr), term in selected)
+                    if term in selected:
+                        expected.append(getattr(model, attr)(feature))
+                torch.testing.assert_close(logits, sum(expected))
+                torch.testing.assert_close(logits, sum(terms))
+                nn.functional.cross_entropy(logits, torch.tensor([0, 1])).backward()
+                self.assertEqual(model.encoder.weight.grad is not None, bool(set(selected) & {'video', 'interaction'}))
+                self.assertEqual(model.encoder_audio.weight.grad is not None, bool(set(selected) & {'audio', 'interaction'}))
+                if selected == ('audio',):
+                    signed, _, metadata = explain_video_loss(model, torch.ones(1, 3, 2, 16, 16),
+                                                              torch.ones(1, 1), torch.tensor([0]))
+                    self.assertEqual(signed.abs().sum().item(), 0)
+                    self.assertFalse(metadata['video_dependency'])
+
     def test_noise_reproducible_rms(self):
         import torch
         noise = white_noise(40960, 42, .05)
