@@ -15,6 +15,16 @@ EMOTION_CODES = {3: 0, 4: 1, 5: 2, 6: 3, 8: 4, 7: 5}
 NUM_CLASSES = len(EMOTIONS)
 TEST_CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 LOGIT_TERMS = ('video', 'interaction')
+INTERACTION_TERMS = ('video', 'audio', 'interaction')
+
+
+def normalize_terms(names):
+    names = ['video' if name == 'visual' else name for name in names]
+    if not names or any(name not in INTERACTION_TERMS for name in names):
+        raise ValueError('Choose at least one term from visual, audio, interaction')
+    if len(set(names)) != len(names):
+        raise ValueError('Each term may be selected only once (visual and video are aliases)')
+    return tuple(name for name in INTERACTION_TERMS if name in names)
 
 
 def discover(video_root, audio_root):
@@ -151,21 +161,28 @@ def make_model(args):
             self.encoder_audio = backbone.encoder_audio
             self.video_layer_weights = backbone.video_layer_weights
             self.audio_layer_weights = backbone.audio_layer_weights
-            self.wv = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
-            self.logit_terms = tuple(getattr(args, 'logit_terms', LOGIT_TERMS))
-            # Only legacy explanation reruns explicitly request the old audio head.
+            self.logit_terms = normalize_terms(getattr(args, 'logit_terms', LOGIT_TERMS))
+            if 'video' in self.logit_terms:
+                self.wv = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
             if 'audio' in self.logit_terms:
                 self.wa = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
-            self.wf = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
+            if 'interaction' in self.logit_terms:
+                self.wf = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
 
         def forward(self, video, audio, return_terms=False):
-            v = self.encoder(video).mean(dim=1)  # B,L,D
-            a = self.encoder_audio(audio).mean(dim=1)
-            ov = (v * self.video_layer_weights.softmax(0)[None, :, None]).sum(1)
-            oa = (a * self.audio_layer_weights.softmax(0)[None, :, None]).sum(1)
-            values = dict(video=self.wv(ov), interaction=self.wf(ov * oa))
+            values = {}
+            if 'video' in self.logit_terms or 'interaction' in self.logit_terms:
+                v = self.encoder(video).mean(dim=1)  # B,L,D
+                ov = (v * self.video_layer_weights.softmax(0)[None, :, None]).sum(1)
+            if 'audio' in self.logit_terms or 'interaction' in self.logit_terms:
+                a = self.encoder_audio(audio).mean(dim=1)
+                oa = (a * self.audio_layer_weights.softmax(0)[None, :, None]).sum(1)
+            if 'video' in self.logit_terms:
+                values['video'] = self.wv(ov)
             if 'audio' in self.logit_terms:
                 values['audio'] = self.wa(oa)
+            if 'interaction' in self.logit_terms:
+                values['interaction'] = self.wf(ov * oa)
             terms = tuple(values[name] for name in self.logit_terms)
             logits = sum(terms)
             return (logits, terms) if return_terms else logits
@@ -385,9 +402,9 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
     if hasattr(model, 'heads'):
         weights.update({name: head.weight.detach().cpu().numpy() for name, head in model.heads.items()})
     else:
-        weights.update(wv=model.wv.weight.detach().cpu().numpy(), wf=model.wf.weight.detach().cpu().numpy())
-        if 'audio' in model.logit_terms:
-            weights['wa'] = model.wa.weight.detach().cpu().numpy()
+        for term, attribute in (('video', 'wv'), ('audio', 'wa'), ('interaction', 'wf')):
+            if term in model.logit_terms:
+                weights[attribute] = getattr(model, attribute).weight.detach().cpu().numpy()
     np.savez_compressed(output / 'classifier_weights.npz', **weights)
     summary = {}
     for condition in TEST_CONDITIONS:
@@ -435,6 +452,10 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
         parser.add_argument('--heads', nargs='+', choices=['visual', 'video', 'audio', 'fusion_video', 'fusion_audio'],
                             default=['video', 'audio', 'fusion_video', 'fusion_audio'],
                             help='Output heads to sum; visual is an alias for video. Default: all four.')
+    else:
+        parser.add_argument('--terms', '--heads', dest='terms', nargs='+',
+                            choices=['visual', 'video', 'audio', 'interaction'], default=list(LOGIT_TERMS),
+                            help='Terms to sum; visual aliases video. Default: visual interaction.')
     args = parser.parse_args()
     args.training_conditions = list(TEST_CONDITIONS)
     args.logit_terms = list(logit_terms)
@@ -445,6 +466,12 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
         except ValueError as error:
             parser.error(str(error))
         args.logit_terms = list(args.heads)
+    else:
+        try:
+            args.terms = list(normalize_terms(args.terms))
+        except ValueError as error:
+            parser.error(str(error))
+        args.logit_terms = list(args.terms)
     args.architecture = architecture
     if args.explain_limit < 0:
         parser.error('--explain-limit must be nonnegative')
