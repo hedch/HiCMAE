@@ -263,9 +263,9 @@ def recorded_branches(rows):
     if not rows:
         raise ValueError('No prediction rows')
     branches = tuple(b for b in BRANCHES if all(b + '_logit_' + e in rows[0] for e in EMOTIONS))
-    selectable = {'video', 'audio', 'fusion_video', 'fusion_audio'}
-    if not (branches and set(branches) <= selectable) and branches not in (
-            ('video', 'interaction'), ('video', 'audio', 'interaction'), ('video', 'fusion')):
+    fusion_heads = {'video', 'audio', 'fusion_video', 'fusion_audio'}
+    interaction_terms = {'video', 'audio', 'interaction'}
+    if not (branches and (set(branches) <= fusion_heads or set(branches) <= interaction_terms)) and branches != ('video', 'fusion'):
         raise ValueError('Missing or incompatible selected-head logit columns')
     return branches
 
