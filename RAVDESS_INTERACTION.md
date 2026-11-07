@@ -277,3 +277,12 @@ optimizer steps. Use a NEW output directory and retrain; old completed runs are
 not modified. Preparation/expansion tests verify exact counts, neutral references
 and no overlap with held-out emotional trials. Full PyTorch execution remains
 unverified in the editing environment.
+
+## Alternate original-fusion experiment
+
+`run_ravdess_fusion.py` is a separate experiment restoring the original video,
+audio and cross-modal fusion encoders, with `wv(ov) + wf(of)` logits. Fusion feature
+of concatenates the pooled fused video/audio streams. It uses this same split,
+three-condition training mix, heatmaps and analysis workflow. See
+[RAVDESS_FUSION.md](RAVDESS_FUSION.md) for checkpoint requirements and run commands.
+The existing interaction-only script keeps its current two-term architecture.
