@@ -381,11 +381,13 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
     # Fixed final epoch: test monitoring never selects a checkpoint.
     torch.save(dict(model=model.state_dict(), args=vars(args), epoch=args.epochs,
                     emotions=EMOTIONS, checkpoint_selection='final_epoch'), output / 'final.pth')
-    weights = dict(wv=model.wv.weight.detach().cpu().numpy(),
-                   wf=model.wf.weight.detach().cpu().numpy(),
-                   emotions=np.asarray(EMOTIONS), logit_terms=np.asarray(model.logit_terms))
-    if 'audio' in model.logit_terms:
-        weights['wa'] = model.wa.weight.detach().cpu().numpy()
+    weights = dict(emotions=np.asarray(EMOTIONS), logit_terms=np.asarray(model.logit_terms))
+    if hasattr(model, 'heads'):
+        weights.update({name: head.weight.detach().cpu().numpy() for name, head in model.heads.items()})
+    else:
+        weights.update(wv=model.wv.weight.detach().cpu().numpy(), wf=model.wf.weight.detach().cpu().numpy())
+        if 'audio' in model.logit_terms:
+            weights['wa'] = model.wa.weight.detach().cpu().numpy()
     np.savez_compressed(output / 'classifier_weights.npz', **weights)
     summary = {}
     for condition in TEST_CONDITIONS:
@@ -404,7 +406,7 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
 
 
 def main(model_factory=None, pretrained_loader=None, architecture='interaction', logit_terms=LOGIT_TERMS):
-    description = ('Fine-tune HiCMAE video/audio/fusion encoders with video + fusion logits.'
+    description = ('Fine-tune HiCMAE with selectable video/audio/fusion output heads.'
                    if architecture == 'fusion' else __doc__)
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--video-root', required=True)
@@ -429,9 +431,20 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
     parser.add_argument('--skip-explanations', action='store_true')
     parser.add_argument('--explain-limit', type=int, default=0,
                         help='Explain first N test trials in each condition; 0 means all')
+    if architecture == 'fusion':
+        parser.add_argument('--heads', nargs='+', choices=['visual', 'video', 'audio', 'fusion_video', 'fusion_audio'],
+                            default=['video', 'audio', 'fusion_video', 'fusion_audio'],
+                            help='Output heads to sum; visual is an alias for video. Default: all four.')
     args = parser.parse_args()
     args.training_conditions = list(TEST_CONDITIONS)
     args.logit_terms = list(logit_terms)
+    if architecture == 'fusion':
+        from run_ravdess_fusion import normalize_heads
+        try:
+            args.heads = list(normalize_heads(args.heads))
+        except ValueError as error:
+            parser.error(str(error))
+        args.logit_terms = list(args.heads)
     args.architecture = architecture
     if args.explain_limit < 0:
         parser.error('--explain-limit must be nonnegative')
