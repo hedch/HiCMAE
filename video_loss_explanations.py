@@ -99,7 +99,8 @@ def explain_video_loss(model, video, audio, label):
         torch.testing.assert_close(logits.detach(), original_logits, rtol=1e-5, atol=1e-6)
         loss = F.cross_entropy(logits, label)
         records = [capture.records[i] for i in sorted(capture.records)]
-        gradients = torch.autograd.grad(loss, [r['z'] for r in records])
+        # A pure audio head has no computational path through the video encoder.
+        gradients = torch.autograd.grad(loss, [r['z'] for r in records]) if records else ()
         maps = []
         with torch.no_grad():
             for record, gradient in zip(records, gradients):
@@ -109,11 +110,12 @@ def explain_video_loss(model, video, audio, label):
             embed = model.encoder.patch_embed
             grid = (video.shape[2] // embed.tubelet_size,
                     video.shape[3] // embed.patch_size[0], video.shape[4] // embed.patch_size[1])
-            layers = torch.stack(maps).reshape(len(maps), *grid)
+            layers = (torch.stack(maps).reshape(len(maps), *grid) if maps
+                      else video.new_zeros((len(model.encoder.blocks), *grid)))
             signed = layers.sum(0)
             if not torch.isfinite(layers).all():
                 raise RuntimeError('Nonfinite video relevance')
-            metadata = dict(loss=loss.item(), label=label.item(),
+            metadata = dict(loss=loss.item(), label=label.item(), video_dependency=bool(records),
                             prediction=logits.argmax(1).item(),
                             correct=bool(logits.argmax(1).item() == label.item()),
                             logits=logits[0].detach().cpu().tolist(),
@@ -208,9 +210,16 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     print('Loading explanation checkpoint:', checkpoint_path)
     if any(key.startswith('encoder_fusion.') for key in checkpoint['model']):
-        from run_ravdess_fusion import make_model
+        from run_ravdess_fusion import make_model, normalize_heads
         args.architecture = 'fusion'
-        args.logit_terms = ['video', 'fusion']
+        saved_heads = {key.split('.')[1] for key in checkpoint['model'] if key.startswith('heads.')}
+        if saved_heads:
+            args.heads = list(normalize_heads(saved_heads))
+            args.logit_terms = list(args.heads)
+        else:
+            if hasattr(args, 'heads'):
+                delattr(args, 'heads')
+            args.logit_terms = ['video', 'fusion']
     else:
         args.logit_terms = (['video', 'audio', 'interaction'] if 'wa.weight' in checkpoint['model']
                             else ['video', 'interaction'])
