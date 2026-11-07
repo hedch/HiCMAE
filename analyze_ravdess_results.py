@@ -22,8 +22,8 @@ CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 NAMES = {'both': 'Audio + video', 'video_noise': 'Video + white noise',
          'audio_neutral': 'Audio + neutral face'}
 COLORS = {'both': '#2864B4', 'video_noise': '#D37B20', 'audio_neutral': '#23856B'}
-BRANCHES = ('video', 'audio', 'interaction')
-BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B'}
+BRANCHES = ('video', 'audio', 'interaction', 'fusion')
+BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B', 'fusion': '#8654AE'}
 
 
 def read_csv(path):
@@ -262,8 +262,8 @@ def recorded_branches(rows):
     if not rows:
         raise ValueError('No prediction rows')
     branches = tuple(b for b in BRANCHES if all(b + '_logit_' + e in rows[0] for e in EMOTIONS))
-    if 'video' not in branches or 'interaction' not in branches:
-        raise ValueError('Missing video or interaction logit columns')
+    if branches not in (('video', 'interaction'), ('video', 'audio', 'interaction'), ('video', 'fusion')):
+        raise ValueError('Expected video + interaction, legacy video/audio/interaction, or video + fusion logits')
     return branches
 
 
@@ -397,7 +397,7 @@ def analyze_modality_contributions(run, save, dpi, warnings):
                        folder / 'absolute_margin_shares', dpi)
     ablation_plot = []
     for row in ablations:
-        if row['configuration'] in ('drop_video', 'drop_audio', 'drop_interaction'):
+        if row['configuration'].startswith('drop_'):
             ablation_plot.append(dict(condition=row['condition'], emotion=row['emotion'],
                                       branch=row['configuration'][5:], drop=100*row['accuracy_drop']))
     plot_contributions(ablation_plot, 'drop', 'Accuracy drop (percentage points)',
@@ -435,9 +435,11 @@ def main():
     report = dict(run_dir=str(run), checkpoint_epoch=checkpoint_epoch,
                   checkpoint_selection=summary.get('checkpoint_selection', 'best_validation'), emotions=EMOTIONS,
                   conditions=NAMES, warnings=warnings, heatmap_counts=counts,
+                  architecture=summary.get('architecture', 'interaction'),
+                  logit_terms=summary.get('logit_terms'),
                   contributions_available=contributions_available,
                   contribution_competitor='Highest wrong-class logit under both; fixed across conditions',
-                  contribution_interpretation='Descriptive model-score decomposition; interaction is joint, not assigned to either modality',
+                  contribution_interpretation='Descriptive model-score decomposition; interaction/fusion is joint, not assigned to either modality',
                   heatmap_averaging='Positive native map / saved shared trial scale, averaged over tubelets then trials',
                   interpretation='Positive loss relevance; model-input coordinates without facial registration',
                   training_accuracy='Online training crops and changing within-epoch weights',
