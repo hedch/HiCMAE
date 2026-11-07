@@ -21,7 +21,7 @@ class ModalityAnalysisTests(unittest.TestCase):
                 row = dict(video='%d_%d.mp4' % (label, i), label=label,
                            prediction=int(logits.argmax()))
                 row.update({'logit_' + e: logits[j] for j, e in enumerate(EMOTIONS)})
-                for bi, branch in enumerate(BRANCHES):
+                for bi, branch in enumerate(('video', 'audio', 'interaction')):
                     row.update({branch + '_logit_' + e: terms[bi, j] for j, e in enumerate(EMOTIONS)})
                 rows.append(row)
         return rows
@@ -86,6 +86,30 @@ class ModalityAnalysisTests(unittest.TestCase):
             ablations = read_csv(folder / 'term_ablation_accuracy.csv')
             self.assertEqual(len(ablations), 90)
             self.assertFalse(any('audio' in row['configuration'] for row in ablations))
+            self.assertFalse(warnings)
+
+    def test_video_fusion_results_use_fusion_labels(self):
+        from analyze_ravdess_results import (analyze_modality_contributions, CONDITIONS,
+                                            EMOTIONS, write_csv, read_csv, contribution_arrays)
+        rows = self.make_rows()
+        for row in rows:
+            for emotion in EMOTIONS:
+                row['logit_' + emotion] -= row.pop('audio_logit_' + emotion)
+                row['fusion_logit_' + emotion] = row.pop('interaction_logit_' + emotion)
+        _, terms = contribution_arrays(rows)
+        self.assertEqual(terms.shape, (12, 2, 6))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for condition in CONDITIONS:
+                write_csv(root / ('test_predictions_' + condition + '.csv'), rows, list(rows[0]))
+            warnings = []
+            self.assertTrue(analyze_modality_contributions(root, root, 40, warnings))
+            folder = root / 'modality_contributions'
+            summary = read_csv(folder / 'contributions_by_emotion.csv')
+            self.assertEqual({row['branch'] for row in summary}, {'video', 'fusion'})
+            ablations = read_csv(folder / 'term_ablation_accuracy.csv')
+            self.assertEqual({row['configuration'] for row in ablations},
+                             {'full', 'drop_video', 'drop_fusion', 'video_term_only', 'fusion_term_only'})
             self.assertFalse(warnings)
 
 
