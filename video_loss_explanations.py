@@ -221,8 +221,8 @@ def main():
                 delattr(args, 'heads')
             args.logit_terms = ['video', 'fusion']
     else:
-        args.logit_terms = (['video', 'audio', 'interaction'] if 'wa.weight' in checkpoint['model']
-                            else ['video', 'interaction'])
+        args.logit_terms = [term for term, key in (('video', 'wv.weight'), ('audio', 'wa.weight'),
+                                                  ('interaction', 'wf.weight')) if key in checkpoint['model']]
     model = make_model(args)
     model.load_state_dict(checkpoint['model'], strict=True)
     model.to(options.device).eval()
