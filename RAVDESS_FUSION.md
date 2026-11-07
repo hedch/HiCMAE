@@ -1,94 +1,111 @@
-# Video + cross-modal fusion experiment
+# Selectable output heads with original HiCMAE fusion
 
-This separate runner is `run_ravdess_fusion.py`. The interaction-only runner remains
-available as `run_ravdess_interaction.py`. Download the updated repository because
-the fusion runner reuses its data/training helpers and the shared analysis/explainer.
+Use `run_ravdess_fusion.py`. Download the updated repository because this runner
+reuses the shared training, explanation and analysis files.
 
-## Architecture
+## Select heads
 
-All three original HiCMAE encoders are used: video, audio, and cross-modal fusion.
-The fusion encoder is the original `VisionTransformerEncoderForFusion`, with both
-video and audio streams using cross-attention, self-attention, MLPs and normalization.
-Default depths are 10 video layers, 10 audio layers and 2 fusion layers. Default
-embedding dimension is 512 with 8 heads. There is no Hadamard interaction term and
-no independent audio classifier.
+Pass one or more names after `--heads`. By default, all four are selected.
 
-The direct video feature ov is the learned hierarchical pooling of the video
-encoder layers, as in the existing experiment. The fusion encoder receives the
-last-layer video and audio tokens, as in the original model. Its outputs Fv and Fa
-are token-mean-pooled and concatenated:
+| Parameter | Feature projected to six emotion logits |
+| --- | --- |
+| `visual` (alias: `video`) | Hierarchical pooling of video encoder layers |
+| `audio` | Hierarchical pooling of audio encoder layers |
+| `fusion_video` | Mean of the video-stream tokens after the original fusion encoder |
+| `fusion_audio` | Mean of the audio-stream tokens after the original fusion encoder |
+
+Each selected head has its own learned, bias-free D-to-6 projection matrix W.
+The final logits are the sum of the selected projected features:
 
 ```
-ov = hierarchical_pool(video_encoder_layers)     # B,D
-Fv, Fa = fusion_encoder(last_video_tokens, last_audio_tokens)
-of = cat(mean_tokens(Fv), mean_tokens(Fa))        # B,2D
-logits = wv(ov) + wf(of)                         # B,6
+logits = sum(W_head(feature_head) for head in selected_heads)
 ```
 
-wv is a learned, bias-free D-to-6 linear map; wf is a learned, bias-free 2D-to-6
-linear map. Thus weighted summation means two learned projection matrices, not
-scalar mixture weights. Both pooled fusion streams contribute, rather than only
-the fused video stream. Loss gradients train all three encoders and both heads.
+These matrices supply the weights, as in the previous experiment; there are no
+additional scalar mixture coefficients. The two fusion heads use the two separate
+streams of the original bidirectional cross-modal fusion encoder. Both fusion
+streams can depend on both inputs. There is no Hadamard interaction term.
 
-Use the original HiCMAE pretraining checkpoint including fusion weights. The loader
-requires matching names and shapes for all three encoders. A checkpoint from the
-interaction-only experiment is intentionally rejected because it lacks the fusion
-encoder. Only reconstruction decoders and old classifiers are discarded. Set
-`--fusion-depth` to match the checkpoint (released base default: 2).
+Only selected classifier heads are created. Encoder paths required by those heads
+run and receive gradients; unused paths do not run. At least one head is required,
+and duplicate names (including selecting both `visual` and `video`) are rejected.
 
 ## Run
 
-The parameters and Conda environment are the same as the existing experiment.
-Select `run_ravdess_fusion.py` as the script in PyCharm, with a NEW output folder:
+Select this script in PyCharm, using the same environment and data parameters as
+before. Use a new output directory and retrain when changing the head selection.
 
 ```bash
-python run_ravdess_fusion.py --video-root /path/to/videos --audio-root /path/to/audio --checkpoint /path/to/checkpoint-99.pth --output-dir runs/ravdess_fusion01 --epochs 50 --batch-size 4 --fusion-depth 2
+python run_ravdess_fusion.py --video-root /path/to/videos --audio-root /path/to/audio --checkpoint /path/to/checkpoint-99.pth --output-dir runs/four_heads --epochs 50 --batch-size 4 --heads visual audio fusion_video fusion_audio
 ```
 
-For a file/split check without importing the ML dependencies:
+Example values to append to your usual data/checkpoint/output arguments:
+
+```text
+--heads visual fusion_video
+--heads audio
+--heads fusion_video fusion_audio
+```
+
+Omit `--heads` to select all four. `visual` is saved internally as `video` in the
+configuration, checkpoints and prediction columns. Selection order does not change
+the sum.
+
+For a file/split check without ML dependencies:
 
 ```bash
-python run_ravdess_fusion.py --video-root /path/to/videos --audio-root /path/to/audio --output-dir runs/fusion_prepare --prepare-only
+python run_ravdess_fusion.py --video-root /path/to/videos --audio-root /path/to/audio --output-dir runs/fusion_prepare --heads visual fusion_audio --prepare-only
 ```
 
-The same 128/64 mixed-actor split per emotion is used: 768 base training trials,
-384 held-out test trials, no validation. Every training trial expands into original
-audio/video, video with white noise, and audio with static neutral face, shuffled
-across all 2304 presentations each epoch. Training noise changes reproducibly by
-epoch; test noise stays fixed. No test emotional trial enters training.
+Use the original HiCMAE pretraining checkpoint including all three encoders' weights.
+The loader checks names/shapes for video, audio and fusion encoders, discards old
+classifiers/decoders, and initializes the selected classifiers. Match `--depth`,
+`--embed-dim` and `--fusion-depth` to the checkpoint. Defaults are 10 layers per
+unimodal encoder, 2 fusion layers, and dimension 512 with 8 attention heads.
 
-## Saved results, explanations and analysis
+The same mixed-actor split has 128 training and 64 test trials per emotion: 768
+base training trials and 384 held-out test trials, with no validation set. Each
+training trial appears in all three conditions (both inputs, video with white
+noise, audio with a static neutral face), shuffled across 2304 presentations per
+epoch. Training noise changes reproducibly each epoch; test noise stays fixed.
 
-The final epoch is saved as `final.pth`, with `architecture=fusion` in run configuration
-and test summary. Prediction CSVs store `video_logit_{emotion}` and
-`fusion_logit_{emotion}` plus their total. Weight archives contain wv and wf.
-Per-epoch condition metrics, accuracy, correctness, losses, manifests and final
-test outputs keep the existing file structure.
+## Outputs and analysis
 
-Video explanations use the SAME pooled-query algorithm, layer aggregation,
-cross-entropy target, positive mask scaling and image overlays. Hooks still capture
-only the video encoder's self-attention layers. Gradients pass through the complete
-new classifier and fusion encoder; fusion attention itself is not separately mapped.
-The explanation-only entrypoint detects fusion checkpoints automatically:
+The final epoch checkpoint is `final.pth`. Configuration and checkpoint metadata
+record the head selection. Prediction CSVs contain each selected head's class
+logits and their total. The weights archive stores each selected head's matrix
+under its canonical name. Per-epoch metrics, trial correctness, manifests and
+three-condition test outputs retain their existing format.
 
 ```bash
-python video_loss_explanations.py --output-dir runs/ravdess_fusion01 --device cuda
-python analyze_ravdess_results.py --run-dir runs/ravdess_fusion01
+python video_loss_explanations.py --output-dir runs/four_heads --device cuda
+python analyze_ravdess_results.py --run-dir runs/four_heads
 ```
 
-The same analysis script produces all accuracy curves, emotion bars, global average
-heatmaps and contribution plots. Branch labels are video and fusion. Score-removal
-analyses include drop_video and drop_fusion. Removing the direct video head leaves
-video information in the fusion branch. These are output-term analyses rather than
-independent modality removals. Older interaction and three-term results remain supported.
+The shared analysis still produces accuracy curves, emotion bars and global
+average video heatmaps. Contribution, term-only and score-removal analyses adapt
+to the selected heads. With a single head, removing it leaves no classifier;
+the removal figure explains this instead of reporting an arbitrary zero-logit
+prediction accuracy. Removing one fusion head is an output-term removal, not an
+input-modality removal.
 
-All settings documented in RAVDESS_INTERACTION.md (noise RMS, explanation limits,
-input naming, visual controls, saved maps, analysis coverage) also apply.
+Video explanations retain the same loss target, pooled-query algorithm,
+aggregation and colorful overlays. Hooks capture video-encoder self-attention;
+gradients include whichever selected heads depend on video. With only `audio`,
+the loss has no video dependency: exported video heatmaps are zero and overlays
+show the unchanged frames. The three test input conditions are still evaluated.
+
+Explanation-only loading automatically reconstructs the head selection from a
+checkpoint. Previous combined-fusion checkpoints (video plus a single head over
+concatenated fusion streams) and older interaction runs remain supported.
+
+The existing `run_ravdess_interaction.py` architecture remains available. Other
+data and explanation settings in [RAVDESS_INTERACTION.md](RAVDESS_INTERACTION.md)
+also apply.
 
 ## Validation
 
-Python compilation, synthetic preparation and numerical fusion-output analysis tests
-are available without PyTorch. Optional tests check the summed-logit formula, audio
-and fusion gradient flow and strict fusion-checkpoint loading using the original
-fusion module. Full training and attribution cannot be verified in the editing
-environment because its PyTorch dependencies and real media/checkpoints are absent.
+Tests cover all 15 nonempty head combinations in numerical result analysis and
+optional PyTorch forward/gradient checks, as well as aliases, invalid selections,
+legacy results and single-head analysis. Full training requires the real media,
+pretrained checkpoint and PyTorch environment.
