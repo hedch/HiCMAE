@@ -262,7 +262,7 @@ def make_loaders(splits, args):
     return loaders
 
 
-def train(splits, args, output):
+def train(splits, args, output, model_factory=None, pretrained_loader=None):
     import numpy as np
     import torch
     from sklearn.metrics import accuracy_score, recall_score, f1_score, confusion_matrix
@@ -270,8 +270,8 @@ def train(splits, args, output):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    model = make_model(args)
-    load_pretrained(model, args.checkpoint)
+    model = (model_factory or make_model)(args)
+    (pretrained_loader or load_pretrained)(model, args.checkpoint)
     model.to(device)
     loaders = make_loaders(splits, args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.05)
@@ -394,7 +394,8 @@ def train(splits, args, output):
         save_predictions(output / f'test_predictions_{condition}.csv', records)
     (output / 'test_metrics.json').write_text(json.dumps(
         dict(emotions=EMOTIONS, checkpoint_epoch=args.epochs, checkpoint_file='final.pth',
-             checkpoint_selection='final_epoch', logit_terms=list(model.logit_terms), conditions=summary), indent=2))
+             checkpoint_selection='final_epoch', architecture=getattr(args, 'architecture', 'interaction'),
+             logit_terms=list(model.logit_terms), conditions=summary), indent=2))
     print('Final-epoch checkpoint test results:', json.dumps(summary))
     if not args.skip_explanations:
         from video_loss_explanations import export_test_explanations
@@ -402,16 +403,20 @@ def train(splits, args, output):
                                  device, output, args.explain_limit)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(model_factory=None, pretrained_loader=None, architecture='interaction', logit_terms=LOGIT_TERMS):
+    description = ('Fine-tune HiCMAE video/audio/fusion encoders with video + fusion logits.'
+                   if architecture == 'fusion' else __doc__)
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--video-root', required=True)
     parser.add_argument('--audio-root', required=True)
     parser.add_argument('--checkpoint')
-    parser.add_argument('--output-dir', default='runs/ravdess_interaction')
+    parser.add_argument('--output-dir', default='runs/ravdess_' + architecture)
     parser.add_argument('--prepare-only', action='store_true')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--embed-dim', type=int, choices=[384, 512], default=512)
     parser.add_argument('--depth', type=int, default=10)
+    parser.add_argument('--fusion-depth', type=int, default=2,
+                        help='Cross-modal fusion layers (used by the separate fusion experiment)')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -426,11 +431,14 @@ def main():
                         help='Explain first N test trials in each condition; 0 means all')
     args = parser.parse_args()
     args.training_conditions = list(TEST_CONDITIONS)
-    args.logit_terms = list(LOGIT_TERMS)
+    args.logit_terms = list(logit_terms)
+    args.architecture = architecture
     if args.explain_limit < 0:
         parser.error('--explain-limit must be nonnegative')
     if args.epochs < 1 or args.batch_size < 1 or args.depth < 1 or args.lr <= 0:
         parser.error('epochs, batch-size, depth and lr must be positive')
+    if architecture == 'fusion' and args.fusion_depth < 1:
+        parser.error('--fusion-depth must be positive for the fusion experiment')
     if not args.prepare_only and not args.checkpoint:
         parser.error('--checkpoint is required for fine-tuning')
     if not 0 < args.noise_rms <= 1:
@@ -462,7 +470,7 @@ def main():
         writer.writerows(expanded_train)
     print(json.dumps(report, indent=2))
     if not args.prepare_only:
-        train(splits, args, output)
+        train(splits, args, output, model_factory=model_factory, pretrained_loader=pretrained_loader)
 
 
 if __name__ == '__main__':
