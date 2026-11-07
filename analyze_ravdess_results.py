@@ -22,8 +22,9 @@ CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 NAMES = {'both': 'Audio + video', 'video_noise': 'Video + white noise',
          'audio_neutral': 'Audio + neutral face'}
 COLORS = {'both': '#2864B4', 'video_noise': '#D37B20', 'audio_neutral': '#23856B'}
-BRANCHES = ('video', 'audio', 'interaction', 'fusion')
-BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B', 'fusion': '#8654AE'}
+BRANCHES = ('video', 'audio', 'interaction', 'fusion', 'fusion_video', 'fusion_audio')
+BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B',
+                 'fusion': '#8654AE', 'fusion_video': '#23856B', 'fusion_audio': '#8654AE'}
 
 
 def read_csv(path):
@@ -258,12 +259,14 @@ def aggregate_heatmaps(run, save, targets, dpi, warnings):
 
 
 def recorded_branches(rows):
-    """New two-term runs omit audio columns; old three-term runs retain them."""
+    """Identify selected fusion-run heads or legacy interaction/fusion terms."""
     if not rows:
         raise ValueError('No prediction rows')
     branches = tuple(b for b in BRANCHES if all(b + '_logit_' + e in rows[0] for e in EMOTIONS))
-    if branches not in (('video', 'interaction'), ('video', 'audio', 'interaction'), ('video', 'fusion')):
-        raise ValueError('Expected video + interaction, legacy video/audio/interaction, or video + fusion logits')
+    selectable = {'video', 'audio', 'fusion_video', 'fusion_audio'}
+    if not (branches and set(branches) <= selectable) and branches not in (
+            ('video', 'interaction'), ('video', 'audio', 'interaction'), ('video', 'fusion')):
+        raise ValueError('Missing or incompatible selected-head logit columns')
     return branches
 
 
@@ -281,6 +284,14 @@ def contribution_arrays(rows, branches=None):
 
 
 def plot_contributions(rows, field, ylabel, title, path, dpi):
+    if not rows:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(.5, .5, 'Only one head selected: removing it leaves no classifier.\nNo term-removal accuracy is reported.',
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(title)
+        ax.axis('off')
+        save_figure(fig, path, dpi)
+        return
     fig, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=True)
     branches = tuple(b for b in BRANCHES if any(row['branch'] == b for row in rows))
     x, width = np.arange(len(EMOTIONS)), .8 / len(branches)
@@ -342,7 +353,8 @@ def analyze_modality_contributions(run, save, dpi, warnings):
     # These remove terms from the existing output. They do not retrain or replace inputs.
     configurations = {'full': tuple(range(len(branches)))}
     for i, branch in enumerate(branches):
-        configurations['drop_' + branch] = tuple(j for j in range(len(branches)) if j != i)
+        if len(branches) > 1:
+            configurations['drop_' + branch] = tuple(j for j in range(len(branches)) if j != i)
         configurations[branch + '_term_only'] = (i,)
     for condition in CONDITIONS:
         rows = predictions[condition]
