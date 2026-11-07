@@ -281,8 +281,9 @@ unverified in the editing environment.
 ## Alternate original-fusion experiment
 
 `run_ravdess_fusion.py` is a separate experiment restoring the original video,
-audio and cross-modal fusion encoders, with `wv(ov) + wf(of)` logits. Fusion feature
-of concatenates the pooled fused video/audio streams. It uses this same split,
+audio and cross-modal fusion encoders. Use `--heads` to select any combination of
+`visual`, `audio`, `fusion_video` and `fusion_audio`; their learned projections are
+summed as logits (all four by default). It uses this same split,
 three-condition training mix, heatmaps and analysis workflow. See
 [RAVDESS_FUSION.md](RAVDESS_FUSION.md) for checkpoint requirements and run commands.
 The existing interaction-only script keeps its current two-term architecture.
