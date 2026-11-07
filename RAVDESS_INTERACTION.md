@@ -287,3 +287,47 @@ summed as logits (all four by default). It uses this same split,
 three-condition training mix, heatmaps and analysis workflow. See
 [RAVDESS_FUSION.md](RAVDESS_FUSION.md) for checkpoint requirements and run commands.
 The existing interaction-only script keeps its current two-term architecture.
+
+## Select interaction-model output terms
+
+`run_ravdess_interaction.py` accepts `--terms` (alias `--heads`) followed by one
+or more of `visual`, `audio`, and `interaction`. `video` aliases `visual`.
+Omitting this option preserves the previous default: visual plus interaction.
+
+Append one of these examples to your usual data/checkpoint/output arguments:
+
+```text
+--terms visual audio interaction
+--terms visual interaction
+--terms audio interaction
+--terms visual audio
+--terms interaction
+--terms audio
+--terms visual
+```
+
+The logits sum exactly the selected terms:
+
+```
+visual:       Wv(ov)
+audio:        Wa(oa)
+interaction:  Wf(ov * oa)    # elementwise feature product
+```
+
+Each W is a learned, bias-free D-to-6 matrix, with no additional scalar mixture
+weights. Only selected classifier heads are created. The interaction term uses
+both encoders even when the visual/audio standalone terms are omitted. A direct
+visual-only selection runs only the video encoder; an audio-only selection runs
+only the audio encoder. Duplicate aliases and empty selections are rejected.
+
+Use a new output directory and retrain when changing terms. The configuration,
+prediction contribution columns and classifier_weights.npz record the selection.
+The same three-condition training/testing protocol, data split, optimizer,
+per-epoch results and final-epoch checkpoint rule apply.
+
+Use the updated video_loss_explanations.py and analyze_ravdess_results.py alongside
+the runner. They support every term subset and older checkpoints/results. With
+only the audio term, video heatmaps are zero because the loss does not depend on
+video; overlays show the original input frames. A single-term run has no meaningful
+term-removal classifier, so analysis does not assign an accuracy to removing its
+only term. The fusion runner's separate four-head selection remains available.
