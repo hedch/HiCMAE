@@ -112,6 +112,42 @@ class ModalityAnalysisTests(unittest.TestCase):
                              {'full', 'drop_video', 'drop_fusion', 'video_term_only', 'fusion_term_only'})
             self.assertFalse(warnings)
 
+    def test_selectable_four_heads_and_single_head_analysis(self):
+        import itertools
+        import numpy as np
+        from analyze_ravdess_results import (analyze_modality_contributions, CONDITIONS, EMOTIONS,
+                                            write_csv, read_csv, contribution_arrays, recorded_branches)
+        heads = ('video', 'audio', 'fusion_video', 'fusion_audio')
+        base = self.make_rows()
+        for n in range(1, 5):
+            for selected in itertools.combinations(heads, n):
+                rows = []
+                for old in base:
+                    row = {k: old[k] for k in ('video', 'label', 'prediction')}
+                    for emotion in EMOTIONS:
+                        value = {'video': old['video_logit_' + emotion],
+                                 'audio': old['audio_logit_' + emotion],
+                                 'fusion_video': old['interaction_logit_' + emotion],
+                                 'fusion_audio': .5 * old['interaction_logit_' + emotion]}
+                        for head in selected:
+                            row[head + '_logit_' + emotion] = value[head]
+                        row['logit_' + emotion] = sum(value[head] for head in selected)
+                    row['prediction'] = int(np.argmax([row['logit_' + e] for e in EMOTIONS]))
+                    rows.append(row)
+                self.assertEqual(recorded_branches(rows), selected)
+                logits, terms = contribution_arrays(rows)
+                np.testing.assert_allclose(logits, terms.sum(1))
+                if selected not in (heads, ('audio',), ('fusion_audio',)):
+                    continue
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for condition in CONDITIONS:
+                        write_csv(root / ('test_predictions_' + condition + '.csv'), rows, list(rows[0]))
+                    self.assertTrue(analyze_modality_contributions(root, root, 40, []))
+                    ablations = read_csv(root / 'modality_contributions' / 'term_ablation_accuracy.csv')
+                    if n == 1:
+                        self.assertFalse(any(r['configuration'].startswith('drop_') for r in ablations))
+
 
 if __name__ == '__main__':
     unittest.main()
