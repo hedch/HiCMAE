@@ -1,4 +1,4 @@
-# DBM fusion with adversarial condition confusion
+# DBM fusion with two pairwise condition adversaries
 
 Run `run_ravdess_dbm.py` as a separate experiment. Keep the updated repository's
 shared runner, analysis and explanation files alongside it. Existing interaction
@@ -11,8 +11,8 @@ and original-fusion runners remain available.
 3. Separate feature heads: Linear(D, visible_dim), LayerNorm, tanh.
 4. A two-hidden-layer undirected Gaussian-visible/Bernoulli-hidden DBM.
 5. Six-emotion linear classifier from the inferred top hidden probabilities.
-6. A separate three-condition classifier from the same top representation, reached
-   through a gradient reversal operation.
+6. Two separate binary condition classifiers from the same top representation,
+   each reached through its own gradient reversal operation.
 
 The encoder feature heads supply embeddings, not six-class emotion logits, to the
 DBM. There is no direct visual/audio summation or Hadamard interaction head.
@@ -40,43 +40,54 @@ not asserted to have converged. This distinction matters when describing the
 method in a paper. The learned fusion parameters are new; only HiCMAE encoders
 and matching pooling weights are initialized from the checkpoint.
 
-## Condition adversary and objective
+## Pairwise condition adversaries and objective
 
-Condition targets describe the inputs actually constructed by the data loader:
+New runs replace the previous three-way classifier with two independent binary
+classifiers operating on the fused DBM representation:
 
-| Saved ID | Internal condition | Meaning |
-| --- | --- | --- |
-| 0 | both | Original visual + original audio |
-| 1 | video_noise | Original visual + white-noise audio |
-| 2 | audio_neutral | Static neutral face + original audio |
+| Classifier | Label 0 | Label 1 | Excluded presentations |
+| --- | --- | --- | --- |
+| `audio_vs_av` | Original audiovisual | Original audio + static neutral face | Video + white-noise audio |
+| `video_vs_av` | Original audiovisual | Original video + white-noise audio | Audio + static neutral face |
 
-All three conditions receive emotion and condition cross-entropy. The two players
-have different gradient objectives:
+Original audiovisual rows contribute to both losses. Each control row contributes
+only to its own pair's loss. Emotion CE still uses all three conditions. No labels
+are inferred from filenames or emotion categories. Each binary classifier has its
+own parameters and learns to minimize its eligible-pair CE; its reversed feature
+gradient encourages that pair to become indistinguishable:
 
 ```
-encoders + feature heads + DBM: minimize L_emotion - lambda * L_condition
-emotion classifier:            minimize L_emotion
-condition classifier:          minimize L_condition
+encoders + feature heads + DBM:
+    minimize L_emotion - lambda_audio * L_audio_vs_av - lambda_video * L_video_vs_av
+emotion classifier:
+    minimize L_emotion
+binary classifiers:
+    minimize their respective condition cross-entropies
 ```
 
-The implementation backpropagates `L_emotion + L_condition`, with a gradient
-reversal layer whose backward multiplier is `-lambda` on the condition path to
-the shared representation. Thus the classifier learns to identify the condition,
-while the feature extractor learns to confuse it. Naively minimizing the negative
-condition loss for the classifier itself would train a deliberately wrong
-classifier rather than an adversarial one.
+`--audio-av-lambda` controls audio-neutral vs audiovisual alignment.
+`--video-av-lambda` controls video-noise vs audiovisual alignment. Both default to
+`--condition-lambda` (0.1) unless explicitly supplied. Weights must be finite and
+nonnegative. Setting a weight to 0 disables that adversary's feature gradient,
+while its classifier continues to learn as a diagnostic.
 
-`--condition-lambda` defaults to 0.1 and must be finite/nonnegative. Setting it to
-0 removes the adversarial feature gradient; the condition classifier still learns
-as a diagnostic. No auxiliary emotion heads from the interaction experiment are
-used. The condition classifier is absent from emotion prediction and the video
-heatmap target. Confusing this classifier does not by itself establish equal
-modality reliance or guarantee AV>A=V performance.
+Each minibatch uses main emotion CE averaged over all rows, plus each binary CE
+averaged over that pair's eligible rows. A classifier with no eligible examples
+in a minibatch contributes no loss for that batch. Gradient reversal applies
+`-lambda_audio` or `-lambda_video` to the corresponding feature gradient; classifier
+parameter gradients retain the positive CE sign. There are no added emotion
+auxiliary heads. Neither condition classifier enters emotion prediction or the
+video heatmap target.
+
+The full epoch gives each binary classifier 1536 eligible training presentations:
+768 audiovisual and 768 of its paired control. Binary chance accuracy is 50% on
+this balanced design. Alignment does not by itself guarantee equal modality
+reliance or AV>A=V performance; inspect emotion performance alongside confusion.
 
 ## Run
 
 ```bash
-python run_ravdess_dbm.py --video-root /path/to/videos --audio-root /path/to/audio --checkpoint /path/to/checkpoint-99.pth --output-dir runs/ravdess_dbm01 --epochs 50 --batch-size 4 --condition-lambda 0.1 --dbm-visible-dim 128 --dbm-hidden-dims 256 128 --dbm-steps 5
+python run_ravdess_dbm.py --video-root /path/to/videos --audio-root /path/to/audio --checkpoint /path/to/checkpoint-99.pth --output-dir runs/ravdess_dbm01 --epochs 50 --batch-size 4 --audio-av-lambda 0.1 --video-av-lambda 0.1 --dbm-visible-dim 128 --dbm-hidden-dims 256 128 --dbm-steps 5
 ```
 
 Use a new output folder and retrain. Match `--embed-dim` and `--depth` to your
@@ -101,7 +112,7 @@ epoch is saved, without test-based checkpoint selection.
 
 Existing epoch emotion metrics, trial predictions, final metrics, manifests,
 `final.pth`, and configuration are retained. Config records `architecture=dbm`,
-DBM settings, adversarial coefficient, condition-class order and training method.
+DBM settings, both adversarial coefficients, pair definitions, condition-class order and training method.
 Each prediction row includes the sole `dbm_logit_{emotion}` term plus the final
 logits. There are no independently attributable additive audio/video terms.
 The classifier archive contains the DBM emotion projection; the checkpoint contains
@@ -109,16 +120,22 @@ all encoder, DBM and classifier parameters.
 
 Additional diagnostics:
 
-- `condition_metrics.csv`: epoch and split, emotion CE, condition CE, condition
-  accuracy/correct/total, prediction entropy, coefficient, effective feature
-  objective (`emotion CE - lambda * condition CE`) and backward surrogate.
-- `history.jsonl` and final test JSONs: `condition_adversary` metrics.
-- Prediction CSVs: `condition_target`, `condition_prediction`, `condition_correct`
-  and `condition_loss` for each presentation.
+- `pairwise_condition_metrics.csv`: epoch, split, adversary name, emotion CE,
+  eligible binary CE/accuracy/correct/total, entropy, coefficient, effective
+  feature objective and backward surrogate. Ineligible test splits are omitted
+  for that classifier.
+- `history.jsonl` and final test JSONs: `pairwise_condition_adversaries`, with each
+  classifier's metrics, plus `adversarial_feature_objective`. A classifier with
+  no eligible examples has total 0 and null loss/accuracy/entropy.
+- Prediction CSVs: `audio_vs_av_target/prediction/correct/loss` and
+  `video_vs_av_target/prediction/correct/loss`. Fields are blank on unrelated rows.
 
-The backward surrogate is emotion CE plus condition CE during training. Its value
-is not the feature player's objective; gradient reversal gives the two parameter
-sets their proper different signs. Evaluation's `loss` remains emotion CE.
+The training backward surrogate is emotion CE plus both available binary CEs;
+gradient reversal gives the feature extractor the requested negative signs.
+Existing `loss` fields remain emotion CE. Epoch component losses are averaged over
+eligible presentations, while each optimized minibatch uses its own eligible-row
+means. Therefore recombining epoch means is a descriptive feature objective and
+need not equal the average optimized minibatch objective exactly.
 
 ```bash
 python video_loss_explanations.py --output-dir runs/ravdess_dbm01 --device cuda
@@ -131,12 +148,20 @@ folders. Gradients propagate through DBM mean-field inference; condition CE is n
 part of the explanation target. Average heatmaps and existing emotion accuracy
 figures remain supported.
 
-Analysis adds `condition_adversary_learning.png/.pdf`: condition accuracy, CE and
-entropy over epochs for training and pooled testing across all three conditions.
-Uniform predictions have accuracy 1/3 on this balanced design and CE/entropy
-ln(3). Inspect emotion accuracy too: a condition classifier at chance can also
-occur when the shared representation has collapsed. Training diagnostics alone
-are not an independent test of condition invariance.
+Analysis adds two sets of learning curves:
+
+- `condition_adversary_learning_audio_vs_av.png/.pdf`
+- `condition_adversary_learning_video_vs_av.png/.pdf`
+
+Each plots binary accuracy, CE and entropy for training and pooled testing of
+ONLY the relevant pair. Uniform predictions have accuracy 1/2 and CE/entropy
+ln(2). Inspect emotion accuracy too: chance condition accuracy can also occur
+when the shared representation collapses. These diagnostics alone are not an
+independent test of condition invariance.
+
+Older DBM checkpoints with the three-way classifier still load for explanations,
+and their original three-way diagnostics remain analyzable. New pairwise runs
+require retraining in a new output folder; existing runs are not converted.
 
 DBM score-decomposition plots contain the sole DBM output term, not separate audio
 and video contributions. Removing that only term leaves no classifier, so no
