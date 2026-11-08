@@ -1,4 +1,4 @@
-"""HiCMAE encoders + discriminatively trained DBM + condition adversary.
+"""HiCMAE encoders + discriminatively trained DBM + two pairwise adversaries.
 
 Example additions to the usual data/checkpoint/output arguments:
   --condition-lambda 0.1 --dbm-visible-dim 128 --dbm-hidden-dims 256 128 --dbm-steps 5
@@ -8,6 +8,40 @@ import run_ravdess_interaction as experiment
 
 LOGIT_TERMS = ('dbm',)
 CONDITION_CLASSES = experiment.TEST_CONDITIONS  # both, video_noise, audio_neutral
+PAIRWISE_CONDITIONS = {'audio_vs_av': 'audio_neutral', 'video_vs_av': 'video_noise'}
+
+
+def pairwise_targets(conditions):
+    """0=AV, 1=the paired control, None=unrelated condition (excluded)."""
+    if any(condition not in CONDITION_CLASSES for condition in conditions):
+        raise ValueError('Unknown input condition')
+    return {name: [0 if condition == 'both' else (1 if condition == control else None)
+                   for condition in conditions] for name, control in PAIRWISE_CONDITIONS.items()}
+
+
+def pairwise_lambdas(args):
+    result = {}
+    for name, argument in (('audio_vs_av', 'audio_av_lambda'), ('video_vs_av', 'video_av_lambda')):
+        value = getattr(args, argument, None)
+        value = args.condition_lambda if value is None else value
+        if not math.isfinite(value) or value < 0:
+            raise ValueError('Pairwise adversarial weights must be finite and nonnegative')
+        result[name] = value
+    return result
+
+
+def pairwise_cross_entropies(logits, conditions):
+    """Compute each CE solely over its AV/control pair, including empty batches."""
+    import torch
+    import torch.nn.functional as F
+    labels = pairwise_targets(conditions)
+    result = {}
+    for name, scores in logits.items():
+        targets = torch.tensor([-1 if value is None else value for value in labels[name]], device=scores.device)
+        mask = targets >= 0
+        values = F.cross_entropy(scores[mask], targets[mask], reduction='none') if mask.any() else scores.new_empty(0)
+        result[name] = dict(targets=targets, mask=mask, losses=values)
+    return result
 
 
 def configure_parser(parser):
@@ -15,16 +49,23 @@ def configure_parser(parser):
     parser.add_argument('--condition-lambda', type=float, default=.1,
                         help='Reversed condition-loss gradient scale for encoders/DBM (default .1)')
     parser.add_argument('--condition-hidden-dim', type=int, default=128)
+    parser.add_argument('--audio-av-lambda', type=float, default=None,
+                        help='Audio-neutral vs audiovisual reversed gradient weight; defaults to --condition-lambda')
+    parser.add_argument('--video-av-lambda', type=float, default=None,
+                        help='Video-noise vs audiovisual reversed gradient weight; defaults to --condition-lambda')
     parser.add_argument('--dbm-visible-dim', type=int, default=128)
     parser.add_argument('--dbm-hidden-dims', nargs=2, type=int, default=[256, 128], metavar=('H1', 'H2'))
     parser.add_argument('--dbm-steps', type=int, default=5,
                         help='Number of tied bidirectional mean-field refinement steps')
-    parser.set_defaults(condition_classes=list(CONDITION_CLASSES), dbm_training='discriminative_mean_field')
+    parser.set_defaults(condition_classes=list(CONDITION_CLASSES), dbm_training='discriminative_mean_field',
+                        condition_adversary_mode='pairwise', pairwise_conditions=PAIRWISE_CONDITIONS)
 
 
 def validate_args(args):
     if not math.isfinite(args.condition_lambda) or args.condition_lambda < 0:
         raise ValueError('--condition-lambda must be finite and nonnegative')
+    coefficients = pairwise_lambdas(args)
+    args.audio_av_lambda, args.video_av_lambda = coefficients['audio_vs_av'], coefficients['video_vs_av']
     if min(args.dbm_visible_dim, *args.dbm_hidden_dims, args.dbm_steps, args.condition_hidden_dim) < 1:
         raise ValueError('DBM dimensions, inference steps and condition hidden dimension must be positive')
 
@@ -60,10 +101,16 @@ def make_model(args):
             self.dbm = MultimodalDBM(args.dbm_visible_dim, args.dbm_hidden_dims, args.dbm_steps)
             self.logit_terms = LOGIT_TERMS
             self.heads = nn.ModuleDict({'dbm': nn.Linear(args.dbm_hidden_dims[1], experiment.NUM_CLASSES, bias=False)})
-            self.condition_classifier = nn.Sequential(
-                nn.Linear(args.dbm_hidden_dims[1], args.condition_hidden_dim), nn.ReLU(),
-                nn.Linear(args.condition_hidden_dim, len(CONDITION_CLASSES)))
             self.condition_lambda = args.condition_lambda
+            self.pairwise_adversaries = getattr(args, 'condition_adversary_mode', 'three_way') == 'pairwise'
+            def classifier(classes):
+                return nn.Sequential(nn.Linear(args.dbm_hidden_dims[1], args.condition_hidden_dim), nn.ReLU(),
+                                     nn.Linear(args.condition_hidden_dim, classes))
+            if self.pairwise_adversaries:
+                self.condition_lambdas = pairwise_lambdas(args)
+                self.condition_classifiers = nn.ModuleDict({name: classifier(2) for name in PAIRWISE_CONDITIONS})
+            else:
+                self.condition_classifier = classifier(len(CONDITION_CLASSES))
 
         def forward(self, video, audio, return_terms=False, return_adversary=False):
             v = self.encoder(video).mean(1)
@@ -74,7 +121,11 @@ def make_model(args):
             logits = self.heads['dbm'](fused)
             terms = (logits,)
             if return_adversary:
-                condition_logits = self.condition_classifier(reverse_gradient(fused, self.condition_lambda))
+                if self.pairwise_adversaries:
+                    condition_logits = {name: head(reverse_gradient(fused, self.condition_lambdas[name]))
+                                        for name, head in self.condition_classifiers.items()}
+                else:
+                    condition_logits = self.condition_classifier(reverse_gradient(fused, self.condition_lambda))
                 return logits, terms, condition_logits
             return (logits, terms) if return_terms else logits
 
