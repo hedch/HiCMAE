@@ -285,8 +285,12 @@ def make_loaders(splits, args):
             indices = np.clip((times * fps).astype(int), 0, len(vr) - 1)
             if condition == 'audio_neutral':
                 neutral = VideoReader(row['neutral_video'], ctx=cpu(0), num_threads=1)
-                # One neutral midpoint face repeated across 16 frames: no mouth-motion cue.
-                pixels = neutral.get_batch([len(neutral) // 2] * 16).asnumpy()
+                # New runs use frame 0 as a static image, repeated across time.
+                # Old configs omit this policy and retain their midpoint control
+                # when regenerating explanations from an existing checkpoint.
+                frame_policy = getattr(args, 'neutral_frame_policy', 'midpoint')
+                neutral_index = 0 if frame_policy == 'first' else len(neutral) // 2
+                pixels = np.repeat(neutral.get_batch([neutral_index]).asnumpy(), 16, axis=0)
             else:
                 pixels = vr.get_batch(indices).asnumpy()
             frames = torch.from_numpy(pixels).permute(0, 3, 1, 2).float() / 255
@@ -613,6 +617,7 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
     description = ('Fine-tune HiCMAE with selectable video/audio/fusion output heads.'
                    if architecture == 'fusion' else __doc__)
     parser = argparse.ArgumentParser(description=description)
+    parser.set_defaults(neutral_frame_policy='first')
     parser.add_argument('--video-root', required=True)
     parser.add_argument('--audio-root', required=True)
     parser.add_argument('--checkpoint')
