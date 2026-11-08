@@ -169,7 +169,11 @@ def make_loaders(splits, args):
             start = random.uniform(0, duration - span) if self.training else (duration - span) / 2
             times = start + np.arange(16) * span / 16
             indices = np.clip((times * fps).astype(int), 0, len(vr) - 1)
-            if condition == 'audio_neutral':
+            if (condition == 'audio_neutral' and self.training
+                    and getattr(args, 'training_audio_only_visual', 'neutral') == 'white'):
+                # Pure RGB white before the same normal preprocessing as all video.
+                pixels = np.full((16, 160, 160, 3), 255, dtype=np.uint8)
+            elif condition == 'audio_neutral':
                 neutral = VideoReader(row['neutral_video'], ctx=cpu(0), num_threads=1)
                 # New runs use frame 0 as a static image, repeated across time.
                 # Old configs omit this policy and retain their midpoint control
@@ -454,6 +458,8 @@ def main():
         parser.error('Noise RMS must be in (0,1] and explanation limit nonnegative')
     args.architecture, args.logit_terms = ARCHITECTURE, list(LOGIT_TERMS)
     args.neutral_frame_policy = 'first'
+    args.training_audio_only_visual = 'white'
+    args.testing_audio_only_visual = 'neutral'
     args.training_conditions = list(TEST_CONDITIONS)
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
     args.test_indicators = [1, 1]
