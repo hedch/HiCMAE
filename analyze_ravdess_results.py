@@ -419,39 +419,46 @@ def analyze_modality_contributions(run, save, dpi, warnings):
 
 
 def plot_condition_learning(run, save, dpi):
-    """Train and pooled balanced-test condition accuracy/CE/entropy per epoch."""
-    path = run / 'condition_metrics.csv'
+    """Plot legacy three-way or each binary adversary on eligible test pairs."""
+    pair_path = run / 'pairwise_condition_metrics.csv'
+    path = pair_path if pair_path.exists() else run / 'condition_metrics.csv'
     if not path.exists():
         return False
     rows = read_csv(path)
-    groups = {'Training': [], 'Testing (all conditions)': []}
-    for row in rows:
-        if row['split'] == 'train':
-            groups['Training'].append(row)
-    epochs = sorted({int(row['epoch']) for row in rows})
-    for epoch in epochs:
-        tested = [row for row in rows if int(row['epoch']) == epoch and row['split'].startswith('test_')]
-        if {row['split'] for row in tested} != {'test_' + c for c in CONDITIONS}:
-            continue
-        total = sum(int(row['total']) for row in tested)
-        groups['Testing (all conditions)'].append(dict(epoch=epoch,
-            **{key: sum(float(row[key]) * int(row['total']) for row in tested) / total
-               for key in ('accuracy', 'loss', 'entropy')}))
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    for ax, key, title, baseline in zip(axes, ('accuracy', 'loss', 'entropy'),
-            ('Condition accuracy', 'Condition cross-entropy', 'Condition prediction entropy'),
-            (1/3, np.log(3), np.log(3))):
-        for label, records in groups.items():
-            if records:
-                records = sorted(records, key=lambda row: int(row['epoch']))
-                ax.plot([int(row['epoch']) for row in records], [float(row[key]) for row in records], label=label)
-        ax.axhline(baseline, color='.4', linestyle='--', label='Uniform three-condition prediction')
-        ax.set(title=title, xlabel='Epoch')
-        if key == 'accuracy':
-            ax.set_ylim(0, 1)
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-        ax.legend(fontsize=8)
-    save_figure(fig, save / 'condition_adversary_learning', dpi)
+    paired = path == pair_path
+    specifications = [('audio_vs_av', 'audio_neutral'), ('video_vs_av', 'video_noise')] if paired else [(None, None)]
+    for adversary, control in specifications:
+        selected = [row for row in rows if not paired or row['adversary'] == adversary]
+        groups = {'Training': [row for row in selected if row['split'] == 'train'],
+                  'Testing (eligible conditions)': []}
+        required = {'test_both', 'test_' + control} if paired else {'test_' + c for c in CONDITIONS}
+        for epoch in sorted({int(row['epoch']) for row in selected}):
+            tested = [row for row in selected if int(row['epoch']) == epoch and row['split'] in required]
+            if {row['split'] for row in tested} != required:
+                continue
+            total = sum(int(row['total']) for row in tested)
+            groups['Testing (eligible conditions)'].append(dict(epoch=epoch,
+                **{key: sum(float(row[key]) * int(row['total']) for row in tested) / total
+                   for key in ('accuracy', 'loss', 'entropy')}))
+        classes = 2 if paired else 3
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ax, key, title, baseline in zip(axes, ('accuracy', 'loss', 'entropy'),
+                ('Condition accuracy', 'Condition cross-entropy', 'Condition prediction entropy'),
+                (1/classes, np.log(classes), np.log(classes))):
+            for label, records in groups.items():
+                if records:
+                    records = sorted(records, key=lambda row: int(row['epoch']))
+                    ax.plot([int(row['epoch']) for row in records], [float(row[key]) for row in records], label=label)
+            ax.axhline(baseline, color='.4', linestyle='--', label='Uniform prediction')
+            ax.set(title=title, xlabel='Epoch')
+            if key == 'accuracy':
+                ax.set_ylim(0, 1)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.legend(fontsize=8)
+        if paired:
+            fig.suptitle(adversary.replace('_', ' '))
+        suffix = '_' + adversary if paired else ''
+        save_figure(fig, save / ('condition_adversary_learning' + suffix), dpi)
     return True
 
 
