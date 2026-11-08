@@ -19,6 +19,11 @@ LOGIT_TERMS = ('video', 'interaction')
 INTERACTION_TERMS = ('video', 'audio', 'interaction')
 
 
+def condition_ids(rows, indices, fallback='both'):
+    """Condition labels come from input construction, never emotion/filename."""
+    return [TEST_CONDITIONS.index(rows[index].get('condition', fallback)) for index in indices]
+
+
 def normalize_terms(names):
     names = ['video' if name == 'visual' else name for name in names]
     if not names or any(name not in INTERACTION_TERMS for name in names):
@@ -334,6 +339,7 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
     prediction_dir.mkdir()
     aux_weights = auxiliary_weights(args)
     use_auxiliary = any(aux_weights.values())
+    use_adversary = getattr(model, 'supports_condition_adversary', False)
     if use_auxiliary and not hasattr(model, 'aux_heads'):
         raise ValueError('Auxiliary losses require the interaction model with auxiliary heads')
 
@@ -341,6 +347,7 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
         model.train(training)
         labels, predictions, losses, records = [], [], [], []
         objective_sum = 0.
+        condition_stats = dict(loss_sum=0., correct=0, total=0, entropy_sum=0.)
         auxiliary_stats = {name: dict(loss_sum=0., correct=0, total=0)
                            for name, weight in aux_weights.items() if weight > 0}
         with torch.set_grad_enabled(training):
@@ -349,7 +356,11 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                 av_mask = torch.tensor([loader.dataset.rows[index].get('condition', 'both') == 'both'
                                         for index in indices.tolist()], device=device, dtype=torch.bool)
                 auxiliary = {}
-                if training and use_auxiliary:
+                condition_logits = None
+                if use_adversary:
+                    logits, terms, condition_logits = model(v.to(device), a.to(device), return_terms=True,
+                                                           return_adversary=True)
+                elif training and use_auxiliary:
                     logits, terms, auxiliary = model(v.to(device), a.to(device), return_terms=True,
                                                     return_aux=True, aux_mask=av_mask)
                 else:
@@ -357,6 +368,20 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                 # Terms come from this exact forward pass, including during training.
                 torch.testing.assert_close(logits, sum(terms))
                 loss, batch_losses, aux_losses = training_objective(logits, target, auxiliary, av_mask, aux_weights)
+                if condition_logits is not None:
+                    condition_targets = torch.tensor(condition_ids(loader.dataset.rows, indices.tolist(),
+                                                                   getattr(loader.dataset, 'condition', 'both')), device=device)
+                    condition_losses = torch.nn.functional.cross_entropy(condition_logits, condition_targets, reduction='none')
+                    condition_probs = condition_logits.detach().softmax(1)
+                    condition_predictions = condition_logits.detach().argmax(1)
+                    condition_stats['loss_sum'] += condition_losses.detach().sum().item()
+                    condition_stats['correct'] += (condition_predictions == condition_targets).sum().item()
+                    condition_stats['total'] += len(y)
+                    condition_stats['entropy_sum'] += (-(condition_probs * condition_probs.clamp_min(1e-12).log()).sum(1)).sum().item()
+                    # +CE trains the classifier correctly. The model's gradient
+                    # reversal makes the feature gradient -lambda*dCE/dfeatures.
+                    if training:
+                        loss = loss + condition_losses.mean()
                 if not torch.isfinite(loss):
                     raise RuntimeError('Nonfinite loss')
                 if training:
@@ -390,6 +415,11 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                                   label=label, prediction=prediction, correct=int(label == prediction), loss=value)
                     record.update(zip(['p_' + e for e in EMOTIONS], probability))
                     record.update(zip(['logit_' + e for e in EMOTIONS], logit_values[offset]))
+                    if condition_logits is not None:
+                        record.update(condition_target=int(condition_targets[offset].item()),
+                                      condition_prediction=int(condition_predictions[offset].item()),
+                                      condition_correct=int(condition_predictions[offset].item() == condition_targets[offset].item()),
+                                      condition_loss=float(condition_losses[offset].detach().item()))
                     for branch, branch_values in zip(model.logit_terms, term_values):
                         record.update(zip([branch + '_logit_' + e for e in EMOTIONS], branch_values[offset]))
                     records.append(record)
@@ -404,6 +434,15 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                                                accuracy=stats['correct'] / stats['total'] if stats['total'] else None,
                                                correct=stats['correct'], total=stats['total'], weight=aux_weights[name])
                                     for name, stats in auxiliary_stats.items()}
+        if use_adversary:
+            condition_loss = condition_stats['loss_sum'] / condition_stats['total']
+            metrics['condition_adversary'] = dict(
+                loss=condition_loss, accuracy=condition_stats['correct'] / condition_stats['total'],
+                correct=condition_stats['correct'], total=condition_stats['total'],
+                entropy=condition_stats['entropy_sum'] / condition_stats['total'],
+                coefficient=model.condition_lambda,
+                feature_objective=metrics['loss'] - model.condition_lambda * condition_loss,
+                backward_surrogate=objective_sum / len(labels))
         return metrics, records
 
     def save_predictions(path, records):
@@ -423,6 +462,16 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
             writer.writerow(dict(epoch=epoch, split=name, learning_rate=learning_rate,
                                  **{k: metrics[k] for k in fields if k in metrics}))
         save_predictions(prediction_dir / ('%s_epoch_%03d.csv' % (name, epoch)), records)
+        if 'condition_adversary' in metrics:
+            condition_path = output / 'condition_metrics.csv'
+            exists = condition_path.exists()
+            with condition_path.open('a', newline='') as f:
+                fields = ['epoch', 'split', 'emotion_loss', 'loss', 'accuracy', 'correct', 'total',
+                          'entropy', 'coefficient', 'feature_objective', 'backward_surrogate']
+                writer = csv.DictWriter(f, fieldnames=fields)
+                if not exists:
+                    writer.writeheader()
+                writer.writerow(dict(epoch=epoch, split=name, emotion_loss=metrics['loss'], **metrics['condition_adversary']))
 
     for epoch in range(args.epochs):
         learning_rate = optimizer.param_groups[0]['lr']
@@ -499,7 +548,8 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                                  device, output, args.explain_limit)
 
 
-def main(model_factory=None, pretrained_loader=None, architecture='interaction', logit_terms=LOGIT_TERMS):
+def main(model_factory=None, pretrained_loader=None, architecture='interaction', logit_terms=LOGIT_TERMS,
+         parser_configurator=None, args_validator=None):
     description = ('Fine-tune HiCMAE with selectable video/audio/fusion output heads.'
                    if architecture == 'fusion' else __doc__)
     parser = argparse.ArgumentParser(description=description)
@@ -529,7 +579,7 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
         parser.add_argument('--heads', nargs='+', choices=['visual', 'video', 'audio', 'fusion_video', 'fusion_audio'],
                             default=['video', 'audio', 'fusion_video', 'fusion_audio'],
                             help='Output heads to sum; visual is an alias for video. Default: all four.')
-    else:
+    elif architecture == 'interaction':
         parser.add_argument('--terms', '--heads', dest='terms', nargs='+',
                             choices=['visual', 'video', 'audio', 'interaction'], default=list(LOGIT_TERMS),
                             help='Terms to sum; visual aliases video. Default: visual interaction.')
@@ -537,6 +587,8 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
                             help='Training-only visual CE weight on real AV examples; 0 disables (default .5)')
         parser.add_argument('--aux-audio-weight', type=float, default=.5,
                             help='Training-only audio CE weight on real AV examples; 0 disables (default .5)')
+    if parser_configurator:
+        parser_configurator(parser)
     args = parser.parse_args()
     args.training_conditions = list(TEST_CONDITIONS)
     args.logit_terms = list(logit_terms)
@@ -547,7 +599,7 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
         except ValueError as error:
             parser.error(str(error))
         args.logit_terms = list(args.heads)
-    else:
+    elif architecture == 'interaction':
         try:
             args.terms = list(normalize_terms(args.terms))
         except ValueError as error:
@@ -556,6 +608,8 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
     args.architecture = architecture
     try:
         auxiliary_weights(args)
+        if args_validator:
+            args_validator(args)
     except ValueError as error:
         parser.error(str(error))
     if args.explain_limit < 0:
