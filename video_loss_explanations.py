@@ -209,7 +209,10 @@ def main():
         checkpoint_path = output / 'best.pth'  # Backward-compatible old actor-split run.
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     print('Loading explanation checkpoint:', checkpoint_path)
-    if any(key.startswith('encoder_fusion.') for key in checkpoint['model']):
+    if any(key.startswith('dbm.') for key in checkpoint['model']):
+        from run_ravdess_dbm import make_model
+        args.architecture, args.logit_terms = 'dbm', ['dbm']
+    elif any(key.startswith('encoder_fusion.') for key in checkpoint['model']):
         from run_ravdess_fusion import make_model, normalize_heads
         args.architecture = 'fusion'
         saved_heads = {key.split('.')[1] for key in checkpoint['model'] if key.startswith('heads.')}
