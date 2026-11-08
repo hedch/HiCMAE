@@ -12,6 +12,15 @@ from run_ravdess_interaction import (balanced_split, discover, make_model,
 
 
 class TermSelectionTests(unittest.TestCase):
+    def test_auxiliary_weight_validation_and_legacy_default(self):
+        from run_ravdess_interaction import auxiliary_weights
+        self.assertEqual(auxiliary_weights(SimpleNamespace()), {'video': 0., 'audio': 0.})
+        self.assertEqual(auxiliary_weights(SimpleNamespace(aux_video_weight=.5, aux_audio_weight=0.)),
+                         {'video': .5, 'audio': 0.})
+        for value in (-1., float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                auxiliary_weights(SimpleNamespace(aux_video_weight=value))
+
     def test_alias_order_and_invalid_terms(self):
         from run_ravdess_interaction import normalize_terms
         self.assertEqual(normalize_terms(['interaction', 'visual', 'audio']),
@@ -133,6 +142,55 @@ class DataTests(unittest.TestCase):
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('torch', 'timm', 'einops')),
                      'Requires upstream model dependencies')
 class ModelTests(unittest.TestCase):
+    def test_auxiliary_heads_do_not_change_inference(self):
+        import torch
+        from unittest.mock import patch
+        from run_ravdess_interaction import training_objective
+        nn = torch.nn
+
+        class Encoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(1, 3, 1, 384))
+            def forward(self, x):
+                return self.weight.expand(x.shape[0], -1, -1, -1)
+
+        def backbone(**kwargs):
+            return SimpleNamespace(encoder=Encoder(), encoder_audio=Encoder(),
+                                   video_layer_weights=nn.Parameter(torch.ones(1)),
+                                   audio_layer_weights=nn.Parameter(torch.ones(1)))
+
+        for selected in (('interaction',), ('audio',), ('video',)):
+            args = SimpleNamespace(embed_dim=384, depth=1, drop_path=0., logit_terms=selected,
+                                   aux_video_weight=.7, aux_audio_weight=.2)
+            with patch('modeling_finetune_av.AudioVisionTransformer', side_effect=backbone):
+                model = make_model(args).eval()
+            v, a = torch.ones(3, 1), torch.ones(3, 1)
+            y = torch.tensor([0, 1, 2])
+            mask = torch.tensor([False, True, False])
+            before = model(v, a)
+            before.sum().backward()
+            self.assertTrue(all(p.grad is None for p in model.aux_heads.parameters()))
+            model.zero_grad(set_to_none=True)
+            logits, terms, aux = model(v, a, return_aux=True, aux_mask=mask)
+            torch.testing.assert_close(before.detach(), logits)
+            torch.testing.assert_close(logits, sum(terms))
+            self.assertTrue(all(scores.shape == (1, 6) for scores in aux.values()))
+            loss, main, aux_losses = training_objective(logits, y, aux, mask, {'video': .7, 'audio': .2})
+            expected = nn.functional.cross_entropy(logits, y)
+            expected += .7 * nn.functional.cross_entropy(aux['video'], y[mask])
+            expected += .2 * nn.functional.cross_entropy(aux['audio'], y[mask])
+            torch.testing.assert_close(loss, expected)
+            loss.backward()
+            self.assertTrue(all(p.grad is not None for p in model.aux_heads.parameters()))
+            self.assertGreater(model.encoder.weight.grad.abs().sum().item(), 0)
+            self.assertGreater(model.encoder_audio.weight.grad.abs().sum().item(), 0)
+            empty = torch.zeros(3, dtype=torch.bool)
+            logits, _, aux = model(v, a, return_aux=True, aux_mask=empty)
+            loss, main, aux_losses = training_objective(logits, y, aux, empty, {'video': .7, 'audio': .2})
+            torch.testing.assert_close(loss, main.mean())
+            self.assertEqual(aux_losses, {})
+
     def test_every_term_combination(self):
         import torch
         from unittest.mock import patch
