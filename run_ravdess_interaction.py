@@ -348,6 +348,8 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
         labels, predictions, losses, records = [], [], [], []
         objective_sum = 0.
         condition_stats = dict(loss_sum=0., correct=0, total=0, entropy_sum=0.)
+        pair_stats = {name: dict(loss_sum=0., correct=0, total=0, entropy_sum=0.)
+                      for name in getattr(model, 'condition_lambdas', {})}
         auxiliary_stats = {name: dict(loss_sum=0., correct=0, total=0)
                            for name, weight in aux_weights.items() if weight > 0}
         with torch.set_grad_enabled(training):
@@ -368,7 +370,28 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                 # Terms come from this exact forward pass, including during training.
                 torch.testing.assert_close(logits, sum(terms))
                 loss, batch_losses, aux_losses = training_objective(logits, target, auxiliary, av_mask, aux_weights)
-                if condition_logits is not None:
+                pair_outputs = {}
+                if isinstance(condition_logits, dict):
+                    from run_ravdess_dbm import pairwise_cross_entropies
+                    constructed_conditions = [loader.dataset.rows[index].get('condition', getattr(loader.dataset, 'condition', 'both'))
+                                              for index in indices.tolist()]
+                    pair_outputs = pairwise_cross_entropies(condition_logits, constructed_conditions)
+                    for name, pair in pair_outputs.items():
+                        mask, values_pair = pair['mask'], pair['losses']
+                        if not len(values_pair):
+                            continue
+                        if not torch.isfinite(values_pair).all():
+                            raise RuntimeError('Nonfinite pairwise condition loss')
+                        scores = condition_logits[name][mask].detach()
+                        probabilities = scores.softmax(1)
+                        stats = pair_stats[name]
+                        stats['loss_sum'] += values_pair.detach().sum().item()
+                        stats['correct'] += (scores.argmax(1) == pair['targets'][mask]).sum().item()
+                        stats['total'] += len(values_pair)
+                        stats['entropy_sum'] += (-(probabilities * probabilities.clamp_min(1e-12).log()).sum(1)).sum().item()
+                        if training:
+                            loss = loss + values_pair.mean()
+                elif condition_logits is not None:
                     condition_targets = torch.tensor(condition_ids(loader.dataset.rows, indices.tolist(),
                                                                    getattr(loader.dataset, 'condition', 'both')), device=device)
                     condition_losses = torch.nn.functional.cross_entropy(condition_logits, condition_targets, reduction='none')
@@ -415,7 +438,19 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                                   label=label, prediction=prediction, correct=int(label == prediction), loss=value)
                     record.update(zip(['p_' + e for e in EMOTIONS], probability))
                     record.update(zip(['logit_' + e for e in EMOTIONS], logit_values[offset]))
-                    if condition_logits is not None:
+                    if isinstance(condition_logits, dict):
+                        for name, pair in pair_outputs.items():
+                            eligible = bool(pair['mask'][offset].item())
+                            record.update({name + '_' + key: '' for key in ('target', 'prediction', 'correct', 'loss')})
+                            if eligible:
+                                pair_target = int(pair['targets'][offset].item())
+                                pair_prediction = int(condition_logits[name][offset].detach().argmax().item())
+                                pair_loss = torch.nn.functional.cross_entropy(condition_logits[name][offset:offset+1].detach(),
+                                                                              pair['targets'][offset:offset+1])
+                                record.update({name + '_target': pair_target, name + '_prediction': pair_prediction,
+                                               name + '_correct': int(pair_prediction == pair_target),
+                                               name + '_loss': float(pair_loss.detach().item())})
+                    elif condition_logits is not None:
                         record.update(condition_target=int(condition_targets[offset].item()),
                                       condition_prediction=int(condition_predictions[offset].item()),
                                       condition_correct=int(condition_predictions[offset].item() == condition_targets[offset].item()),
@@ -434,7 +469,18 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                                                accuracy=stats['correct'] / stats['total'] if stats['total'] else None,
                                                correct=stats['correct'], total=stats['total'], weight=aux_weights[name])
                                     for name, stats in auxiliary_stats.items()}
-        if use_adversary:
+        if pair_stats:
+            metrics['pairwise_condition_adversaries'] = {
+                name: dict(loss=stats['loss_sum'] / stats['total'] if stats['total'] else None,
+                           accuracy=stats['correct'] / stats['total'] if stats['total'] else None,
+                           entropy=stats['entropy_sum'] / stats['total'] if stats['total'] else None,
+                           correct=stats['correct'], total=stats['total'], coefficient=model.condition_lambdas[name])
+                for name, stats in pair_stats.items()}
+            metrics['adversarial_feature_objective'] = metrics['loss'] - sum(
+                stats['coefficient'] * stats['loss'] for stats in metrics['pairwise_condition_adversaries'].values()
+                if stats['total'])
+            metrics['backward_surrogate'] = objective_sum / len(labels)
+        elif use_adversary:
             condition_loss = condition_stats['loss_sum'] / condition_stats['total']
             metrics['condition_adversary'] = dict(
                 loss=condition_loss, accuracy=condition_stats['correct'] / condition_stats['total'],
@@ -462,6 +508,20 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
             writer.writerow(dict(epoch=epoch, split=name, learning_rate=learning_rate,
                                  **{k: metrics[k] for k in fields if k in metrics}))
         save_predictions(prediction_dir / ('%s_epoch_%03d.csv' % (name, epoch)), records)
+        if 'pairwise_condition_adversaries' in metrics:
+            pair_path = output / 'pairwise_condition_metrics.csv'
+            exists = pair_path.exists()
+            with pair_path.open('a', newline='') as f:
+                fields = ['epoch', 'split', 'adversary', 'emotion_loss', 'loss', 'accuracy', 'correct', 'total',
+                          'entropy', 'coefficient', 'feature_objective', 'backward_surrogate']
+                writer = csv.DictWriter(f, fieldnames=fields)
+                if not exists:
+                    writer.writeheader()
+                for adversary, stats in metrics['pairwise_condition_adversaries'].items():
+                    if stats['total']:
+                        writer.writerow(dict(epoch=epoch, split=name, adversary=adversary, emotion_loss=metrics['loss'],
+                                             feature_objective=metrics['adversarial_feature_objective'],
+                                             backward_surrogate=metrics['backward_surrogate'], **stats))
         if 'condition_adversary' in metrics:
             condition_path = output / 'condition_metrics.csv'
             exists = condition_path.exists()
