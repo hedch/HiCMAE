@@ -212,6 +212,8 @@ def main():
     if any(key.startswith('dbm.') for key in checkpoint['model']):
         from run_ravdess_dbm import make_model
         args.architecture, args.logit_terms = 'dbm', ['dbm']
+        args.condition_adversary_mode = ('pairwise' if any(key.startswith('condition_classifiers.')
+                                                         for key in checkpoint['model']) else 'three_way')
     elif any(key.startswith('encoder_fusion.') for key in checkpoint['model']):
         from run_ravdess_fusion import make_model, normalize_heads
         args.architecture = 'fusion'
