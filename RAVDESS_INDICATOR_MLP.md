@@ -35,7 +35,7 @@ is no DBM, interaction-product term, condition adversary or auxiliary emotion lo
 | --- | --- | --- |
 | Original video + original audio | 1, 1 | 1, 1 |
 | Original video + white-noise audio | 1, 0 | 1, 1 |
-| Repeated neutral image + original audio | 0, 1 | 1, 1 |
+| Audio-only: white image in training, neutral image in testing | 0, 1 | 1, 1 |
 
 All three conditions are mixed and shuffled during training. At testing, both
 indicators are always 1, even when a real modality has been replaced by its control
@@ -43,9 +43,14 @@ input. This is an explicit protocol rule; the test flags are not inferred from t
 condition. The model's eval-mode forward call also defaults to [1,1], so heatmaps
 and standalone evaluation use the same rule. Training requires explicit flags.
 
-The audio-only condition uses frame 0 of the actor/statement/repetition-matched
-neutral sample, repeated across all 16 frames. The original emotional audio is
-retained. Video-only uses fixed-RMS Gaussian white-noise audio. These placeholders
+During audio-only training, the visual input is a solid white RGB image
+(255,255,255), repeated across all 16 frames and processed with the same image
+normalization. During audio-only testing and heatmap regeneration, the visual
+input remains frame 0 of the actor/statement/repetition-matched neutral sample,
+repeated across all 16 frames. The original emotional audio is retained.
+Config records `training_audio_only_visual=white` and
+`testing_audio_only_visual=neutral`. Video-only uses fixed-RMS Gaussian
+white-noise audio. These placeholders
 are still passed through the encoders; availability flags refer to the intended
 emotion-bearing modality. The shared original audiovisual condition remains real
 video/audio. Video and audio are cropped to a synchronized 2.56-second window.
