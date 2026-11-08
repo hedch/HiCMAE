@@ -223,6 +223,11 @@ def main():
     else:
         args.logit_terms = [term for term, key in (('video', 'wv.weight'), ('audio', 'wa.weight'),
                                                   ('interaction', 'wf.weight')) if key in checkpoint['model']]
+        # Reconstruct training-only modules for strict loading, including old runs
+        # without auxiliaries. Inference/explanations never evaluate these heads.
+        for name in ('video', 'audio'):
+            exists = 'aux_heads.' + name + '.weight' in checkpoint['model']
+            setattr(args, 'aux_' + name + '_weight', 1. if exists else 0.)
     model = make_model(args)
     model.load_state_dict(checkpoint['model'], strict=True)
     model.to(options.device).eval()
