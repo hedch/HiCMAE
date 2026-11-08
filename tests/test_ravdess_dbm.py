@@ -11,6 +11,19 @@ from run_ravdess_interaction import condition_ids, expand_training_rows
 
 
 class DBMConfigurationTests(unittest.TestCase):
+    def test_pairwise_targets_masks_and_weights(self):
+        from run_ravdess_dbm import pairwise_targets, pairwise_lambdas
+        self.assertEqual(pairwise_targets(['both', 'video_noise', 'audio_neutral']),
+                         {'audio_vs_av': [0, None, 1], 'video_vs_av': [0, 1, None]})
+        args = SimpleNamespace(condition_lambda=.1, video_av_lambda=.3)
+        self.assertEqual(pairwise_lambdas(args), {'audio_vs_av': .1, 'video_vs_av': .3})
+        for value in (-1., float('nan'), float('inf')):
+            args.audio_av_lambda = value
+            with self.assertRaises(ValueError):
+                pairwise_lambdas(args)
+        with self.assertRaises(ValueError):
+            pairwise_targets(['unknown'])
+
     def test_defaults_and_invalid_parameters(self):
         parser = argparse.ArgumentParser()
         configure_parser(parser)
@@ -39,6 +52,19 @@ class DBMConfigurationTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Requires PyTorch')
 class DBMTorchTests(unittest.TestCase):
+    def test_binary_losses_exclude_unrelated_rows(self):
+        import torch
+        from run_ravdess_dbm import pairwise_cross_entropies
+        scores = {name: torch.randn(3, 2, requires_grad=True) for name in ('audio_vs_av', 'video_vs_av')}
+        pairs = pairwise_cross_entropies(scores, ['both', 'video_noise', 'audio_neutral'])
+        loss = sum(pair['losses'].mean() for pair in pairs.values())
+        loss.backward()
+        self.assertEqual(scores['audio_vs_av'].grad[1].abs().sum().item(), 0)
+        self.assertEqual(scores['video_vs_av'].grad[2].abs().sum().item(), 0)
+        self.assertGreater(scores['audio_vs_av'].grad[[0, 2]].abs().sum().item(), 0)
+        empty = pairwise_cross_entropies({'audio_vs_av': torch.ones(2, 2)}, ['video_noise', 'video_noise'])
+        self.assertEqual(len(empty['audio_vs_av']['losses']), 0)
+
     def test_gradient_reversal_changes_features_but_not_classifier(self):
         import torch
         from dbm_fusion import reverse_gradient
@@ -130,6 +156,19 @@ class DBMTorchTests(unittest.TestCase):
             torch.save(dict(model={k: v for k, v in state.items() if not k.startswith('encoder_audio.')}), path)
             with self.assertRaises(ValueError):
                 load_pretrained(model, path)
+        args.condition_adversary_mode = 'pairwise'
+        args.audio_av_lambda, args.video_av_lambda = .2, .5
+        with patch.dict('sys.modules', {'modeling_finetune_av': fake_module}):
+            paired = make_model(args).eval()
+            paired_restore = make_model(args).eval()
+        logits, _, discriminators = paired(v, a, return_adversary=True)
+        self.assertEqual(set(discriminators), {'audio_vs_av', 'video_vs_av'})
+        self.assertTrue(all(scores.shape == (3, 2) for scores in discriminators.values()))
+        self.assertEqual(paired.condition_lambdas, {'audio_vs_av': .2, 'video_vs_av': .5})
+        paired_restore.load_state_dict(paired.state_dict(), strict=True)
+        torch.testing.assert_close(logits, paired_restore(v, a))
+        paired(v, a).sum().backward()
+        self.assertTrue(all(parameter.grad is None for parameter in paired.condition_classifiers.parameters()))
 
 
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('numpy', 'matplotlib')),
@@ -162,12 +201,26 @@ class DBMAnalysisTests(unittest.TestCase):
             self.assertTrue(plot_condition_learning(root, root, 40))
             self.assertTrue((root / 'condition_adversary_learning.png').exists())
             self.assertTrue((root / 'condition_adversary_learning.pdf').exists())
+            pair_history = [dict(epoch=epoch, split=split, adversary=name, total=12 if split == 'train' else 6,
+                                 accuracy=.5, loss=np.log(2), entropy=np.log(2))
+                            for epoch in (1, 2) for name, control in (('audio_vs_av', 'audio_neutral'), ('video_vs_av', 'video_noise'))
+                            for split in ('train', 'test_both', 'test_' + control)]
+            write_csv(root / 'pairwise_condition_metrics.csv', pair_history, list(pair_history[0]))
+            self.assertTrue(plot_condition_learning(root, root, 40))
+            for name in ('audio_vs_av', 'video_vs_av'):
+                self.assertTrue((root / ('condition_adversary_learning_' + name + '.png')).exists())
 
 
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('torch', 'numpy', 'sklearn')),
                      'Requires PyTorch/numpy/sklearn')
 class DBMTrainerTests(unittest.TestCase):
     def test_adversarial_training_labels_and_saved_outputs(self):
+        self.check_training_outputs(False)
+
+    def test_pairwise_training_labels_and_saved_outputs(self):
+        self.check_training_outputs(True)
+
+    def check_training_outputs(self, paired):
         import csv
         import json
         import io
@@ -198,11 +251,18 @@ class DBMTrainerTests(unittest.TestCase):
                 super().__init__()
                 self.features = nn.Linear(12, 6)
                 self.heads = nn.ModuleDict({'dbm': nn.Linear(6, 6, bias=False)})
-                self.condition_classifier = nn.Linear(6, 3)
+                if paired:
+                    self.condition_lambdas = {'audio_vs_av': .2, 'video_vs_av': .5}
+                    self.condition_classifiers = nn.ModuleDict({name: nn.Linear(6, 2) for name in self.condition_lambdas})
+                else:
+                    self.condition_classifier = nn.Linear(6, 3)
             def forward(self, v, a, return_terms=False, return_adversary=False):
                 features = self.features(torch.cat((v, a), -1)).tanh()
                 logits = self.heads['dbm'](features)
                 if return_adversary:
+                    if paired:
+                        return logits, (logits,), {name: head(reverse_gradient(features, self.condition_lambdas[name]))
+                                                   for name, head in self.condition_classifiers.items()}
                     return logits, (logits,), self.condition_classifier(reverse_gradient(features, self.condition_lambda))
                 return (logits, (logits,)) if return_terms else logits
         loaders = {'train': torch.utils.data.DataLoader(Dataset(expanded=True), batch_size=4, shuffle=True)}
@@ -215,20 +275,31 @@ class DBMTrainerTests(unittest.TestCase):
             with patch.object(experiment, 'make_loaders', return_value=loaders), redirect_stdout(io.StringIO()):
                 experiment.train({'train': [], 'test': []}, args, output,
                                  model_factory=lambda args: Model(), pretrained_loader=lambda model, path: None)
-            with (output / 'condition_metrics.csv').open() as f:
+            with (output / ('pairwise_condition_metrics.csv' if paired else 'condition_metrics.csv')).open() as f:
                 metrics = list(csv.DictReader(f))
-            self.assertEqual(len(metrics), 8)
+            self.assertEqual(len(metrics), 12 if paired else 8)
             self.assertFalse((output / 'auxiliary_metrics.csv').exists())
             history = [json.loads(line) for line in (output / 'history.jsonl').read_text().splitlines()]
             for entry in history:
-                adv = entry['train']['condition_adversary']
-                self.assertEqual(adv['total'], 18)
-                self.assertAlmostEqual(adv['feature_objective'], entry['train']['loss'] - .4*adv['loss'], places=6)
-                self.assertAlmostEqual(adv['backward_surrogate'], entry['train']['loss'] + adv['loss'], places=6)
+                if paired:
+                    adv = entry['train']['pairwise_condition_adversaries']
+                    self.assertTrue(all(stats['total'] == 12 for stats in adv.values()))
+                    self.assertAlmostEqual(entry['train']['adversarial_feature_objective'],
+                                           entry['train']['loss'] - sum(stats['coefficient']*stats['loss'] for stats in adv.values()), places=6)
+                else:
+                    adv = entry['train']['condition_adversary']
+                    self.assertEqual(adv['total'], 18)
+                    self.assertAlmostEqual(adv['feature_objective'], entry['train']['loss'] - .4*adv['loss'], places=6)
+                    self.assertAlmostEqual(adv['backward_surrogate'], entry['train']['loss'] + adv['loss'], places=6)
             for index, condition in enumerate(CONDITION_CLASSES):
                 with (output / ('test_predictions_' + condition + '.csv')).open() as f:
                     predictions = list(csv.DictReader(f))
-                self.assertEqual({int(row['condition_target']) for row in predictions}, {index})
+                if paired:
+                    for name, control in (('audio_vs_av', 'audio_neutral'), ('video_vs_av', 'video_noise')):
+                        expected = '' if condition not in ('both', control) else ('0' if condition == 'both' else '1')
+                        self.assertEqual({row[name + '_target'] for row in predictions}, {expected})
+                else:
+                    self.assertEqual({int(row['condition_target']) for row in predictions}, {index})
                 for row in predictions:
                     for emotion in experiment.EMOTIONS:
                         self.assertEqual(row['logit_' + emotion], row['dbm_logit_' + emotion])
