@@ -108,6 +108,12 @@ training trial expanded to all three conditions (2304 presentations per epoch)
 and shuffled. Training noise changes each epoch, test noise is fixed. The final
 epoch is saved, without test-based checkpoint selection.
 
+For new runs, audio-neutral video inputs repeat frame 0 of the matched neutral
+sample across all 16 frames. Config records `neutral_frame_policy=first`. The
+shared loader applies this to training, testing and heatmaps. Old configurations
+without the policy retain the previous midpoint-frame control when regenerating
+explanations, so their original test input is preserved.
+
 ## Outputs, heatmaps and analysis
 
 Existing epoch emotion metrics, trial predictions, final metrics, manifests,
