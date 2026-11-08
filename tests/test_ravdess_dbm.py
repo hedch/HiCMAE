@@ -15,6 +15,9 @@ class DBMConfigurationTests(unittest.TestCase):
         from run_ravdess_dbm import pairwise_targets, pairwise_lambdas
         self.assertEqual(pairwise_targets(['both', 'video_noise', 'audio_neutral']),
                          {'audio_vs_av': [0, None, 1], 'video_vs_av': [0, 1, None]})
+        self.assertEqual(pairwise_targets(['both', 'video_noise', 'audio_neutral'],
+                                         {'audio_vs_video': ('audio_neutral', 'video_noise')}),
+                         {'audio_vs_video': [None, 1, 0]})
         args = SimpleNamespace(condition_lambda=.1, video_av_lambda=.3)
         self.assertEqual(pairwise_lambdas(args), {'audio_vs_av': .1, 'video_vs_av': .3})
         for value in (-1., float('nan'), float('inf')):
@@ -30,6 +33,7 @@ class DBMConfigurationTests(unittest.TestCase):
         args = parser.parse_args([])
         validate_args(args)
         self.assertEqual(args.dbm_hidden_dims, [256, 128])
+        self.assertEqual(args.condition_adversary_mode, 'audio_vs_video')
         self.assertEqual(args.condition_classes, ['both', 'video_noise', 'audio_neutral'])
         for key, bad in (('condition_lambda', -1.), ('condition_lambda', float('nan')),
                          ('condition_lambda', float('inf')), ('dbm_steps', 0),
@@ -64,6 +68,13 @@ class DBMTorchTests(unittest.TestCase):
         self.assertGreater(scores['audio_vs_av'].grad[[0, 2]].abs().sum().item(), 0)
         empty = pairwise_cross_entropies({'audio_vs_av': torch.ones(2, 2)}, ['video_noise', 'video_noise'])
         self.assertEqual(len(empty['audio_vs_av']['losses']), 0)
+        scores = torch.randn(3, 2, requires_grad=True)
+        single = pairwise_cross_entropies({'audio_vs_video': scores}, ['both', 'video_noise', 'audio_neutral'])
+        single['audio_vs_video']['losses'].mean().backward()
+        self.assertEqual(scores.grad[0].abs().sum().item(), 0)
+        self.assertGreater(scores.grad[1:].abs().sum().item(), 0)
+        empty = pairwise_cross_entropies({'audio_vs_video': torch.ones(2, 2)}, ['both', 'both'])
+        self.assertEqual(len(empty['audio_vs_video']['losses']), 0)
 
     def test_gradient_reversal_changes_features_but_not_classifier(self):
         import torch
@@ -169,6 +180,15 @@ class DBMTorchTests(unittest.TestCase):
         torch.testing.assert_close(logits, paired_restore(v, a))
         paired(v, a).sum().backward()
         self.assertTrue(all(parameter.grad is None for parameter in paired.condition_classifiers.parameters()))
+        args.condition_adversary_mode = 'audio_vs_video'
+        with patch.dict('sys.modules', {'modeling_finetune_av': fake_module}):
+            single = make_model(args).eval()
+            single_restore = make_model(args).eval()
+        self.assertEqual(tuple(single.condition_classifiers), ('audio_vs_video',))
+        logits, _, adversaries = single(v, a, return_adversary=True)
+        self.assertEqual(tuple(adversaries), ('audio_vs_video',))
+        single_restore.load_state_dict(single.state_dict(), strict=True)
+        torch.testing.assert_close(single_restore(v, a), logits)
 
 
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('numpy', 'matplotlib')),
@@ -209,6 +229,12 @@ class DBMAnalysisTests(unittest.TestCase):
             self.assertTrue(plot_condition_learning(root, root, 40))
             for name in ('audio_vs_av', 'video_vs_av'):
                 self.assertTrue((root / ('condition_adversary_learning_' + name + '.png')).exists())
+            single_history = [dict(epoch=epoch, split=split, adversary='audio_vs_video', total=12 if split == 'train' else 6,
+                                   accuracy=.5, loss=np.log(2), entropy=np.log(2))
+                              for epoch in (1, 2) for split in ('train', 'test_audio_neutral', 'test_video_noise')]
+            write_csv(root / 'pairwise_condition_metrics.csv', single_history, list(single_history[0]))
+            self.assertTrue(plot_condition_learning(root, root, 40))
+            self.assertTrue((root / 'condition_adversary_learning_audio_vs_video.png').exists())
 
 
 @unittest.skipUnless(all(importlib.util.find_spec(m) for m in ('torch', 'numpy', 'sklearn')),
@@ -219,6 +245,9 @@ class DBMTrainerTests(unittest.TestCase):
 
     def test_pairwise_training_labels_and_saved_outputs(self):
         self.check_training_outputs(True)
+
+    def test_single_audio_vs_video_training(self):
+        self.check_training_outputs('audio_vs_video')
 
     def check_training_outputs(self, paired):
         import csv
@@ -252,7 +281,8 @@ class DBMTrainerTests(unittest.TestCase):
                 self.features = nn.Linear(12, 6)
                 self.heads = nn.ModuleDict({'dbm': nn.Linear(6, 6, bias=False)})
                 if paired:
-                    self.condition_lambdas = {'audio_vs_av': .2, 'video_vs_av': .5}
+                    self.condition_lambdas = ({'audio_vs_video': .4} if paired == 'audio_vs_video'
+                                              else {'audio_vs_av': .2, 'video_vs_av': .5})
                     self.condition_classifiers = nn.ModuleDict({name: nn.Linear(6, 2) for name in self.condition_lambdas})
                 else:
                     self.condition_classifier = nn.Linear(6, 3)
@@ -277,7 +307,9 @@ class DBMTrainerTests(unittest.TestCase):
                                  model_factory=lambda args: Model(), pretrained_loader=lambda model, path: None)
             with (output / ('pairwise_condition_metrics.csv' if paired else 'condition_metrics.csv')).open() as f:
                 metrics = list(csv.DictReader(f))
-            self.assertEqual(len(metrics), 12 if paired else 8)
+            self.assertEqual(len(metrics), 6 if paired == 'audio_vs_video' else 12 if paired else 8)
+            if paired == 'audio_vs_video':
+                self.assertNotIn('test_both', {row['split'] for row in metrics})
             self.assertFalse((output / 'auxiliary_metrics.csv').exists())
             history = [json.loads(line) for line in (output / 'history.jsonl').read_text().splitlines()]
             for entry in history:
@@ -295,8 +327,10 @@ class DBMTrainerTests(unittest.TestCase):
                 with (output / ('test_predictions_' + condition + '.csv')).open() as f:
                     predictions = list(csv.DictReader(f))
                 if paired:
-                    for name, control in (('audio_vs_av', 'audio_neutral'), ('video_vs_av', 'video_noise')):
-                        expected = '' if condition not in ('both', control) else ('0' if condition == 'both' else '1')
+                    pairs = ({'audio_vs_video': ('audio_neutral', 'video_noise')} if paired == 'audio_vs_video'
+                             else {'audio_vs_av': ('both', 'audio_neutral'), 'video_vs_av': ('both', 'video_noise')})
+                    for name, pair in pairs.items():
+                        expected = '' if condition not in pair else str(pair.index(condition))
                         self.assertEqual({row[name + '_target'] for row in predictions}, {expected})
                 else:
                     self.assertEqual({int(row['condition_target']) for row in predictions}, {index})
