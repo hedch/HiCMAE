@@ -22,9 +22,9 @@ CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 NAMES = {'both': 'Audio + video', 'video_noise': 'Video + white noise',
          'audio_neutral': 'Audio + neutral face'}
 COLORS = {'both': '#2864B4', 'video_noise': '#D37B20', 'audio_neutral': '#23856B'}
-BRANCHES = ('video', 'audio', 'interaction', 'fusion', 'fusion_video', 'fusion_audio')
+BRANCHES = ('video', 'audio', 'interaction', 'fusion', 'fusion_video', 'fusion_audio', 'dbm')
 BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B',
-                 'fusion': '#8654AE', 'fusion_video': '#23856B', 'fusion_audio': '#8654AE'}
+                 'fusion': '#8654AE', 'fusion_video': '#23856B', 'fusion_audio': '#8654AE', 'dbm': '#23856B'}
 
 
 def read_csv(path):
@@ -265,7 +265,7 @@ def recorded_branches(rows):
     branches = tuple(b for b in BRANCHES if all(b + '_logit_' + e in rows[0] for e in EMOTIONS))
     fusion_heads = {'video', 'audio', 'fusion_video', 'fusion_audio'}
     interaction_terms = {'video', 'audio', 'interaction'}
-    if not (branches and (set(branches) <= fusion_heads or set(branches) <= interaction_terms)) and branches != ('video', 'fusion'):
+    if not (branches and (set(branches) <= fusion_heads or set(branches) <= interaction_terms)) and branches not in (('video', 'fusion'), ('dbm',)):
         raise ValueError('Missing or incompatible selected-head logit columns')
     return branches
 
@@ -418,6 +418,43 @@ def analyze_modality_contributions(run, save, dpi, warnings):
     return True
 
 
+def plot_condition_learning(run, save, dpi):
+    """Train and pooled balanced-test condition accuracy/CE/entropy per epoch."""
+    path = run / 'condition_metrics.csv'
+    if not path.exists():
+        return False
+    rows = read_csv(path)
+    groups = {'Training': [], 'Testing (all conditions)': []}
+    for row in rows:
+        if row['split'] == 'train':
+            groups['Training'].append(row)
+    epochs = sorted({int(row['epoch']) for row in rows})
+    for epoch in epochs:
+        tested = [row for row in rows if int(row['epoch']) == epoch and row['split'].startswith('test_')]
+        if {row['split'] for row in tested} != {'test_' + c for c in CONDITIONS}:
+            continue
+        total = sum(int(row['total']) for row in tested)
+        groups['Testing (all conditions)'].append(dict(epoch=epoch,
+            **{key: sum(float(row[key]) * int(row['total']) for row in tested) / total
+               for key in ('accuracy', 'loss', 'entropy')}))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for ax, key, title, baseline in zip(axes, ('accuracy', 'loss', 'entropy'),
+            ('Condition accuracy', 'Condition cross-entropy', 'Condition prediction entropy'),
+            (1/3, np.log(3), np.log(3))):
+        for label, records in groups.items():
+            if records:
+                records = sorted(records, key=lambda row: int(row['epoch']))
+                ax.plot([int(row['epoch']) for row in records], [float(row[key]) for row in records], label=label)
+        ax.axhline(baseline, color='.4', linestyle='--', label='Uniform three-condition prediction')
+        ax.set(title=title, xlabel='Epoch')
+        if key == 'accuracy':
+            ax.set_ylim(0, 1)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend(fontsize=8)
+    save_figure(fig, save / 'condition_adversary_learning', dpi)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', required=True, help='Existing trained-run output folder')
@@ -443,6 +480,7 @@ def main():
                       'Final epoch' if final_epoch else 'Best validation epoch')
     targets = analyze_predictions(run, save, args.dpi, description)
     contributions_available = analyze_modality_contributions(run, save, args.dpi, warnings)
+    condition_learning_available = plot_condition_learning(run, save, args.dpi)
     counts = aggregate_heatmaps(run, save, targets, args.dpi, warnings)
     report = dict(run_dir=str(run), checkpoint_epoch=checkpoint_epoch,
                   checkpoint_selection=summary.get('checkpoint_selection', 'best_validation'), emotions=EMOTIONS,
@@ -450,6 +488,7 @@ def main():
                   architecture=summary.get('architecture', 'interaction'),
                   logit_terms=summary.get('logit_terms'),
                   contributions_available=contributions_available,
+                  condition_learning_available=condition_learning_available,
                   contribution_competitor='Highest wrong-class logit under both; fixed across conditions',
                   contribution_interpretation='Descriptive model-score decomposition; interaction/fusion is joint, not assigned to either modality',
                   heatmap_averaging='Positive native map / saved shared trial scale, averaged over tubelets then trials',
