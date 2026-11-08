@@ -66,7 +66,7 @@ unimodal encoder, 2 fusion layers, and dimension 512 with 8 attention heads.
 The same mixed-actor split has 128 training and 64 test trials per emotion: 768
 base training trials and 384 held-out test trials, with no validation set. Each
 training trial appears in all three conditions (both inputs, video with white
-noise, audio with a static neutral face), shuffled across 2304 presentations per
+noise, audio with the first neutral frame repeated 16 times), shuffled across 2304 presentations per
 epoch. Training noise changes reproducibly each epoch; test noise stays fixed.
 
 ## Outputs and analysis
