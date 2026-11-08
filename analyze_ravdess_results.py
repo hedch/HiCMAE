@@ -426,12 +426,15 @@ def plot_condition_learning(run, save, dpi):
         return False
     rows = read_csv(path)
     paired = path == pair_path
-    specifications = [('audio_vs_av', 'audio_neutral'), ('video_vs_av', 'video_noise')] if paired else [(None, None)]
-    for adversary, control in specifications:
+    definitions = {'audio_vs_av': ('both', 'audio_neutral'), 'video_vs_av': ('both', 'video_noise'),
+                   'audio_vs_video': ('audio_neutral', 'video_noise')}
+    specifications = [(name, pair) for name, pair in definitions.items()
+                      if any(row.get('adversary') == name for row in rows)] if paired else [(None, None)]
+    for adversary, conditions in specifications:
         selected = [row for row in rows if not paired or row['adversary'] == adversary]
         groups = {'Training': [row for row in selected if row['split'] == 'train'],
                   'Testing (eligible conditions)': []}
-        required = {'test_both', 'test_' + control} if paired else {'test_' + c for c in CONDITIONS}
+        required = {'test_' + c for c in conditions} if paired else {'test_' + c for c in CONDITIONS}
         for epoch in sorted({int(row['epoch']) for row in selected}):
             tested = [row for row in selected if int(row['epoch']) == epoch and row['split'] in required]
             if {row['split'] for row in tested} != required:
