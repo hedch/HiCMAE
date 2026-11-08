@@ -120,6 +120,8 @@ def explain_video_loss(model, video, audio, label):
                             correct=bool(logits.argmax(1).item() == label.item()),
                             logits=logits[0].detach().cpu().tolist(),
                             forward_max_abs_error=(logits.detach()-original_logits).abs().max().item())
+            if hasattr(model, 'test_indicators'):
+                metadata.update(on_v=int(model.test_indicators[0]), on_a=int(model.test_indicators[1]))
             return signed.cpu(), layers.cpu(), metadata
 
 
@@ -182,7 +184,6 @@ def main():
     import argparse
     import csv
     from types import SimpleNamespace
-    from run_ravdess_interaction import make_model, make_loaders, TEST_CONDITIONS
 
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument('--output-dir', required=True, help='Existing experiment output folder')
@@ -195,6 +196,10 @@ def main():
     config = json.loads((output / 'config.json').read_text())
     config.update(device=options.device, explain_limit=options.explain_limit)
     args = SimpleNamespace(**config)
+    if getattr(args, 'architecture', '') == 'indicator_mlp':
+        from run_ravdess_indicator_mlp import make_model, make_loaders, TEST_CONDITIONS
+    else:
+        from run_ravdess_interaction import make_model, make_loaders, TEST_CONDITIONS
     splits = {}
     for name in ('train', 'test'):
         with (output / (name + '.csv')).open(newline='') as f:
@@ -209,7 +214,9 @@ def main():
         checkpoint_path = output / 'best.pth'  # Backward-compatible old actor-split run.
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     print('Loading explanation checkpoint:', checkpoint_path)
-    if any(key.startswith('dbm.') for key in checkpoint['model']):
+    if getattr(args, 'architecture', '') == 'indicator_mlp':
+        args.logit_terms = ['mlp']
+    elif any(key.startswith('dbm.') for key in checkpoint['model']):
         from run_ravdess_dbm import make_model
         args.architecture, args.logit_terms = 'dbm', ['dbm']
         args.condition_adversary_mode = (
