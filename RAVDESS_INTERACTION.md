@@ -331,3 +331,64 @@ only the audio term, video heatmaps are zero because the loss does not depend on
 video; overlays show the original input frames. A single-term run has no meaningful
 term-removal classifier, so analysis does not assign an accuracy to removing its
 only term. The fusion runner's separate four-head selection remains available.
+
+## Training-only auxiliary supervision
+
+New interaction runs enable two separate auxiliary classifiers by default:
+
+```text
+--aux-video-weight 0.5 --aux-audio-weight 0.5
+```
+
+For the interaction-only experiment, append this to your existing command:
+
+```text
+--terms interaction --aux-video-weight 0.5 --aux-audio-weight 0.5
+```
+
+The main logits still contain exactly the selected `--terms`. Auxiliary classifiers
+are independent bias-free D-to-6 projections from the hierarchical video/audio
+encoder features. They are training-only and never contribute to predictions,
+score-removal analysis or the video-explanation target.
+
+For each shuffled training minibatch:
+
+```
+objective = mean(main CE over every presentation)
+          + aux_video_weight * mean(auxiliary visual CE on real AV presentations)
+          + aux_audio_weight * mean(auxiliary audio CE on real AV presentations)
+```
+
+Only rows with `condition=both` receive auxiliary supervision. White-noise audio
+and neutral-face video are not taught to predict the target emotion through an
+auxiliary classifier. A batch with no real AV rows uses main CE alone. Each
+auxiliary loss is averaged over eligible rows in that batch, not all batch rows.
+The auxiliary CE gradients update both the auxiliary classifier and its encoder;
+there is no feature detachment. This encourages discriminative representations
+in each modality but does not guarantee equal modality reliance or AV>A=V accuracy.
+
+Set either weight to zero to disable its auxiliary classifier, or both to zero
+for the previous training objective. Weights must be finite and nonnegative.
+Existing trained checkpoints are unchanged. New runs require a new output folder
+and retraining. Original media splits, shuffled three-condition presentations,
+test conditions, optimizer and final-epoch checkpoint selection stay the same.
+The original-fusion runner does not enable these auxiliary losses.
+
+Existing `loss` fields and curves continue to describe the main classifier CE,
+so they remain comparable across training/testing conditions. Additional outputs:
+
+- `auxiliary_metrics.csv`: epoch, main CE, optimized objective, and each auxiliary
+  classifier's CE, accuracy and eligible trial count. There are 768 eligible AV
+  presentations per full epoch (128 per emotion) for each enabled auxiliary head.
+- `history.jsonl`: the training record also contains `objective_loss` and an
+  `auxiliary` object with loss, accuracy, correct count, total and weight.
+- `classifier_weights.npz`: `aux_video` and/or `aux_audio` contain the auxiliary
+  projection matrices, separate from the selected main matrices.
+- `final.pth`: includes auxiliary parameters and their configured weights, allowing
+  strict checkpoint reconstruction. The updated explanation runner supports both
+  these checkpoints and older runs without auxiliary classifiers.
+
+The logged `objective_loss` is the sample-weighted average of the actual minibatch
+objectives. Epoch auxiliary losses are averaged over eligible AV presentations;
+because minibatches have different AV counts, recombining the epoch component
+means need not reproduce the logged optimized objective exactly.
