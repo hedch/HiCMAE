@@ -12,6 +12,12 @@ from unittest.mock import patch
                      'Requires torch, numpy, scikit-learn')
 class EpochOutputsTests(unittest.TestCase):
     def test_training_and_three_test_histories(self):
+        self.check_training_outputs(False)
+
+    def test_auxiliary_training_and_saved_metrics(self):
+        self.check_training_outputs(True)
+
+    def check_training_outputs(self, auxiliary_enabled):
         import torch
         import run_ravdess_interaction as experiment
 
@@ -24,7 +30,7 @@ class EpochOutputsTests(unittest.TestCase):
                 return len(self.rows)
             def __getitem__(self, i):
                 label = self.rows[i]['label']
-                return torch.eye(6)[label], torch.zeros(6), label, i
+                return torch.eye(6)[label], torch.eye(6)[label] if auxiliary_enabled else torch.zeros(6), label, i
 
         class Model(torch.nn.Module):
             def __init__(self):
@@ -32,9 +38,14 @@ class EpochOutputsTests(unittest.TestCase):
                 self.wv = torch.nn.Linear(6, 6, bias=False)
                 self.wf = torch.nn.Linear(6, 6, bias=False)
                 self.logit_terms = ('video', 'interaction')
-            def forward(self, v, a, return_terms=False):
+                self.aux_heads = torch.nn.ModuleDict({name: torch.nn.Linear(6, 6, bias=False)
+                                                      for name in ('video', 'audio')} if auxiliary_enabled else {})
+            def forward(self, v, a, return_terms=False, return_aux=False, aux_mask=None):
                 terms = (self.wv(v), self.wf(v*a))
                 logits = sum(terms)
+                if return_aux:
+                    return logits, terms, {name: head((v if name == 'video' else a)[aux_mask])
+                                           for name, head in self.aux_heads.items()}
                 return (logits, terms) if return_terms else logits
 
         dataset = Dataset()
@@ -43,6 +54,8 @@ class EpochOutputsTests(unittest.TestCase):
         loaders['train'] = torch.utils.data.DataLoader(Dataset(expanded=True), batch_size=3, shuffle=True)
         args = SimpleNamespace(seed=42, device='cpu', checkpoint='unused', lr=.001,
                                epochs=2, skip_epoch_tests=False, skip_explanations=True)
+        if auxiliary_enabled:
+            args.aux_video_weight, args.aux_audio_weight = .5, .5
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             with patch.object(experiment, 'make_model', return_value=Model()), \
@@ -62,6 +75,21 @@ class EpochOutputsTests(unittest.TestCase):
             import numpy as np
             with np.load(output / 'classifier_weights.npz') as weights:
                 self.assertNotIn('wa', weights.files)
+                self.assertEqual('aux_video' in weights.files, auxiliary_enabled)
+                self.assertEqual('aux_audio' in weights.files, auxiliary_enabled)
+            if auxiliary_enabled:
+                with (output / 'auxiliary_metrics.csv').open() as f:
+                    auxiliary_metrics = list(csv.DictReader(f))
+                self.assertEqual(len(auxiliary_metrics), 2)
+                for row in auxiliary_metrics:
+                    self.assertEqual(int(row['aux_video_total']), 6)
+                    self.assertEqual(int(row['aux_audio_total']), 6)
+                    self.assertGreater(float(row['objective_loss']), float(row['main_loss']))
+                history = [json.loads(line) for line in (output / 'history.jsonl').read_text().splitlines()]
+                self.assertTrue(all(row['train']['auxiliary']['video']['total'] == 6 for row in history))
+                self.assertTrue(all('auxiliary' not in test for row in history for test in row['tests'].values()))
+            else:
+                self.assertFalse((output / 'auxiliary_metrics.csv').exists())
             self.assertFalse((output / 'best.pth').exists())
             self.assertFalse(any(row['split'] == 'val' for row in metrics))
             for row in metrics:
