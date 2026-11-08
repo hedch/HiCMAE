@@ -22,9 +22,9 @@ CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 NAMES = {'both': 'Audio + video', 'video_noise': 'Video + white noise',
          'audio_neutral': 'Audio + neutral face'}
 COLORS = {'both': '#2864B4', 'video_noise': '#D37B20', 'audio_neutral': '#23856B'}
-BRANCHES = ('video', 'audio', 'interaction', 'fusion', 'fusion_video', 'fusion_audio', 'dbm')
+BRANCHES = ('video', 'audio', 'interaction', 'fusion', 'fusion_video', 'fusion_audio', 'dbm', 'mlp')
 BRANCH_COLORS = {'video': '#2864B4', 'audio': '#D37B20', 'interaction': '#23856B',
-                 'fusion': '#8654AE', 'fusion_video': '#23856B', 'fusion_audio': '#8654AE', 'dbm': '#23856B'}
+                 'fusion': '#8654AE', 'fusion_video': '#23856B', 'fusion_audio': '#8654AE', 'dbm': '#23856B', 'mlp': '#8654AE'}
 
 
 def read_csv(path):
@@ -265,7 +265,7 @@ def recorded_branches(rows):
     branches = tuple(b for b in BRANCHES if all(b + '_logit_' + e in rows[0] for e in EMOTIONS))
     fusion_heads = {'video', 'audio', 'fusion_video', 'fusion_audio'}
     interaction_terms = {'video', 'audio', 'interaction'}
-    if not (branches and (set(branches) <= fusion_heads or set(branches) <= interaction_terms)) and branches not in (('video', 'fusion'), ('dbm',)):
+    if not (branches and (set(branches) <= fusion_heads or set(branches) <= interaction_terms)) and branches not in (('video', 'fusion'), ('dbm',), ('mlp',)):
         raise ValueError('Missing or incompatible selected-head logit columns')
     return branches
 
