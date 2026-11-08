@@ -1,4 +1,4 @@
-"""HiCMAE encoders + discriminatively trained DBM + two pairwise adversaries.
+"""HiCMAE encoders + DBM + one audio-neutral versus video-noise adversary.
 
 Example additions to the usual data/checkpoint/output arguments:
   --condition-lambda 0.1 --dbm-visible-dim 128 --dbm-hidden-dims 256 128 --dbm-steps 5
@@ -9,14 +9,18 @@ import run_ravdess_interaction as experiment
 LOGIT_TERMS = ('dbm',)
 CONDITION_CLASSES = experiment.TEST_CONDITIONS  # both, video_noise, audio_neutral
 PAIRWISE_CONDITIONS = {'audio_vs_av': 'audio_neutral', 'video_vs_av': 'video_noise'}
+ADVERSARY_PAIRS = {'audio_vs_av': ('both', 'audio_neutral'),
+                   'video_vs_av': ('both', 'video_noise'),
+                   'audio_vs_video': ('audio_neutral', 'video_noise')}
 
 
-def pairwise_targets(conditions):
-    """0=AV, 1=the paired control, None=unrelated condition (excluded)."""
+def pairwise_targets(conditions, pairs=None):
+    """0=first pair condition, 1=second, None=unrelated (excluded)."""
     if any(condition not in CONDITION_CLASSES for condition in conditions):
         raise ValueError('Unknown input condition')
-    return {name: [0 if condition == 'both' else (1 if condition == control else None)
-                   for condition in conditions] for name, control in PAIRWISE_CONDITIONS.items()}
+    pairs = pairs if pairs is not None else {name: ADVERSARY_PAIRS[name] for name in PAIRWISE_CONDITIONS}
+    return {name: [0 if condition == pair[0] else (1 if condition == pair[1] else None)
+                   for condition in conditions] for name, pair in pairs.items()}
 
 
 def pairwise_lambdas(args):
@@ -31,10 +35,10 @@ def pairwise_lambdas(args):
 
 
 def pairwise_cross_entropies(logits, conditions):
-    """Compute each CE solely over its AV/control pair, including empty batches."""
+    """Compute each CE solely over its configured pair, including empty batches."""
     import torch
     import torch.nn.functional as F
-    labels = pairwise_targets(conditions)
+    labels = pairwise_targets(conditions, {name: ADVERSARY_PAIRS[name] for name in logits})
     result = {}
     for name, scores in logits.items():
         targets = torch.tensor([-1 if value is None else value for value in labels[name]], device=scores.device)
@@ -49,23 +53,21 @@ def configure_parser(parser):
     parser.add_argument('--condition-lambda', type=float, default=.1,
                         help='Reversed condition-loss gradient scale for encoders/DBM (default .1)')
     parser.add_argument('--condition-hidden-dim', type=int, default=128)
-    parser.add_argument('--audio-av-lambda', type=float, default=None,
-                        help='Audio-neutral vs audiovisual reversed gradient weight; defaults to --condition-lambda')
-    parser.add_argument('--video-av-lambda', type=float, default=None,
-                        help='Video-noise vs audiovisual reversed gradient weight; defaults to --condition-lambda')
     parser.add_argument('--dbm-visible-dim', type=int, default=128)
     parser.add_argument('--dbm-hidden-dims', nargs=2, type=int, default=[256, 128], metavar=('H1', 'H2'))
     parser.add_argument('--dbm-steps', type=int, default=5,
                         help='Number of tied bidirectional mean-field refinement steps')
     parser.set_defaults(condition_classes=list(CONDITION_CLASSES), dbm_training='discriminative_mean_field',
-                        condition_adversary_mode='pairwise', pairwise_conditions=PAIRWISE_CONDITIONS)
+                        condition_adversary_mode='audio_vs_video',
+                        adversary_pairs={'audio_vs_video': list(ADVERSARY_PAIRS['audio_vs_video'])})
 
 
 def validate_args(args):
     if not math.isfinite(args.condition_lambda) or args.condition_lambda < 0:
         raise ValueError('--condition-lambda must be finite and nonnegative')
-    coefficients = pairwise_lambdas(args)
-    args.audio_av_lambda, args.video_av_lambda = coefficients['audio_vs_av'], coefficients['video_vs_av']
+    if getattr(args, 'condition_adversary_mode', None) == 'pairwise':
+        coefficients = pairwise_lambdas(args)
+        args.audio_av_lambda, args.video_av_lambda = coefficients['audio_vs_av'], coefficients['video_vs_av']
     if min(args.dbm_visible_dim, *args.dbm_hidden_dims, args.dbm_steps, args.condition_hidden_dim) < 1:
         raise ValueError('DBM dimensions, inference steps and condition hidden dimension must be positive')
 
@@ -102,13 +104,15 @@ def make_model(args):
             self.logit_terms = LOGIT_TERMS
             self.heads = nn.ModuleDict({'dbm': nn.Linear(args.dbm_hidden_dims[1], experiment.NUM_CLASSES, bias=False)})
             self.condition_lambda = args.condition_lambda
-            self.pairwise_adversaries = getattr(args, 'condition_adversary_mode', 'three_way') == 'pairwise'
+            mode = getattr(args, 'condition_adversary_mode', 'three_way')
+            self.pairwise_adversaries = mode in ('pairwise', 'audio_vs_video')
             def classifier(classes):
                 return nn.Sequential(nn.Linear(args.dbm_hidden_dims[1], args.condition_hidden_dim), nn.ReLU(),
                                      nn.Linear(args.condition_hidden_dim, classes))
             if self.pairwise_adversaries:
-                self.condition_lambdas = pairwise_lambdas(args)
-                self.condition_classifiers = nn.ModuleDict({name: classifier(2) for name in PAIRWISE_CONDITIONS})
+                self.condition_lambdas = ({'audio_vs_video': self.condition_lambda} if mode == 'audio_vs_video'
+                                          else pairwise_lambdas(args))
+                self.condition_classifiers = nn.ModuleDict({name: classifier(2) for name in self.condition_lambdas})
             else:
                 self.condition_classifier = classifier(len(CONDITION_CLASSES))
 
