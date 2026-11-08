@@ -110,7 +110,8 @@ The same 384 test trials, labels and ordering are used in each condition. Both
 terms in the classifier stay active; audio enters through the interaction only. White noise is generated in waveform
 space before audio preprocessing; `--noise-rms` defaults to 0.05, fixed across
 trials, with seeds saved per trial. Neutral clips match the actor, statement and
-repetition of the emotional trial. The midpoint frame is repeated. These controls
+repetition of the emotional trial. For new runs, frame 0 (the first decoded image)
+is repeated across all 16 frames. These controls
 are used as inputs during training and testing; neutral is never an emotion target.
 
 `epoch_metrics.csv` and `history.jsonl` record training and all three test conditions
@@ -392,3 +393,11 @@ The logged `objective_loss` is the sample-weighted average of the actual minibat
 objectives. Epoch auxiliary losses are averaged over eligible AV presentations;
 because minibatches have different AV counts, recombining the epoch component
 means need not reproduce the logged optimized objective exactly.
+
+New runs record `neutral_frame_policy=first` in config.json: the shared loader
+decodes only frame 0 of the matched neutral sample and repeats that image 16 times
+for audio-neutral training, testing and explanations. Original emotional audio
+is retained. Configurations from older runs without this setting retain their
+midpoint-frame control when regenerating heatmaps. Use a new output folder and
+retrain to adopt the first-frame control. The shared fusion and DBM runners use
+the same setting.
