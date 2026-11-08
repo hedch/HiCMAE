@@ -6,6 +6,7 @@ Only --prepare-only can run without the upstream ML dependencies.
 import argparse
 import csv
 import json
+import math
 import random
 from pathlib import Path
 
@@ -25,6 +26,30 @@ def normalize_terms(names):
     if len(set(names)) != len(names):
         raise ValueError('Each term may be selected only once (visual and video are aliases)')
     return tuple(name for name in INTERACTION_TERMS if name in names)
+
+
+def auxiliary_weights(args):
+    weights = {name: float(getattr(args, 'aux_' + name + '_weight', 0.)) for name in ('video', 'audio')}
+    if any(not math.isfinite(value) or value < 0 for value in weights.values()):
+        raise ValueError('Auxiliary weights must be finite and nonnegative')
+    return weights
+
+
+def training_objective(logits, target, auxiliary, av_mask, weights):
+    """Main CE on every presentation; auxiliary CE only on real AV examples.
+
+    Auxiliary logits contain only the rows selected by av_mask. Empty-AV batches
+    contribute main CE only. Auxiliary means are conditional on AV rows.
+    """
+    import torch.nn.functional as F
+    main = F.cross_entropy(logits, target, reduction='none')
+    loss, auxiliary_losses = main.mean(), {}
+    if av_mask.any():
+        for name, scores in auxiliary.items():
+            values = F.cross_entropy(scores, target[av_mask], reduction='none')
+            loss = loss + weights[name] * values.mean()
+            auxiliary_losses[name] = values
+    return loss, main, auxiliary_losses
 
 
 def discover(video_root, audio_root):
@@ -168,13 +193,16 @@ def make_model(args):
                 self.wa = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
             if 'interaction' in self.logit_terms:
                 self.wf = nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
+            # Separate training-only classifiers: never summed into main logits.
+            self.aux_heads = nn.ModuleDict({name: nn.Linear(args.embed_dim, NUM_CLASSES, bias=False)
+                                           for name, weight in auxiliary_weights(args).items() if weight > 0})
 
-        def forward(self, video, audio, return_terms=False):
+        def forward(self, video, audio, return_terms=False, return_aux=False, aux_mask=None):
             values = {}
-            if 'video' in self.logit_terms or 'interaction' in self.logit_terms:
+            if 'video' in self.logit_terms or 'interaction' in self.logit_terms or (return_aux and 'video' in self.aux_heads):
                 v = self.encoder(video).mean(dim=1)  # B,L,D
                 ov = (v * self.video_layer_weights.softmax(0)[None, :, None]).sum(1)
-            if 'audio' in self.logit_terms or 'interaction' in self.logit_terms:
+            if 'audio' in self.logit_terms or 'interaction' in self.logit_terms or (return_aux and 'audio' in self.aux_heads):
                 a = self.encoder_audio(audio).mean(dim=1)
                 oa = (a * self.audio_layer_weights.softmax(0)[None, :, None]).sum(1)
             if 'video' in self.logit_terms:
@@ -185,6 +213,15 @@ def make_model(args):
                 values['interaction'] = self.wf(ov * oa)
             terms = tuple(values[name] for name in self.logit_terms)
             logits = sum(terms)
+            if return_aux:
+                features = {}
+                if 'video' in self.aux_heads:
+                    features['video'] = ov
+                if 'audio' in self.aux_heads:
+                    features['audio'] = oa
+                auxiliary = {name: head(features[name] if aux_mask is None else features[name][aux_mask])
+                             for name, head in self.aux_heads.items()}
+                return logits, terms, auxiliary
             return (logits, terms) if return_terms else logits
 
     return InteractionModel()
@@ -198,7 +235,7 @@ def load_pretrained(model, path):
     state = {(k[7:] if k.startswith('module.') else k): v for k, v in state.items()}
     target = model.state_dict()
     kept = {k: v for k, v in state.items()
-            if k in target and not k.startswith(('wv.', 'wa.', 'wf.'))}
+            if k in target and not k.startswith(('wv.', 'wa.', 'wf.', 'aux_heads.'))}
     required = [k for k in target if k.startswith(('encoder.', 'encoder_audio.'))]
     missing = [k for k in required if k not in kept]
     mismatched = [k for k, v in kept.items() if v.shape != target[k].shape]
@@ -295,18 +332,31 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     prediction_dir = output / 'epoch_predictions'
     prediction_dir.mkdir()
+    aux_weights = auxiliary_weights(args)
+    use_auxiliary = any(aux_weights.values())
+    if use_auxiliary and not hasattr(model, 'aux_heads'):
+        raise ValueError('Auxiliary losses require the interaction model with auxiliary heads')
 
     def run_pass(loader, training=False):
         model.train(training)
         labels, predictions, losses, records = [], [], [], []
+        objective_sum = 0.
+        auxiliary_stats = {name: dict(loss_sum=0., correct=0, total=0)
+                           for name, weight in aux_weights.items() if weight > 0}
         with torch.set_grad_enabled(training):
             for v, a, y, indices in loader:
                 target = y.to(device)
-                logits, terms = model(v.to(device), a.to(device), return_terms=True)
+                av_mask = torch.tensor([loader.dataset.rows[index].get('condition', 'both') == 'both'
+                                        for index in indices.tolist()], device=device, dtype=torch.bool)
+                auxiliary = {}
+                if training and use_auxiliary:
+                    logits, terms, auxiliary = model(v.to(device), a.to(device), return_terms=True,
+                                                    return_aux=True, aux_mask=av_mask)
+                else:
+                    logits, terms = model(v.to(device), a.to(device), return_terms=True)
                 # Terms come from this exact forward pass, including during training.
                 torch.testing.assert_close(logits, sum(terms))
-                batch_losses = torch.nn.functional.cross_entropy(logits, target, reduction='none')
-                loss = batch_losses.mean()
+                loss, batch_losses, aux_losses = training_objective(logits, target, auxiliary, av_mask, aux_weights)
                 if not torch.isfinite(loss):
                     raise RuntimeError('Nonfinite loss')
                 if training:
@@ -314,6 +364,12 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
+                objective_sum += loss.detach().item() * len(y)
+                for name, values_aux in aux_losses.items():
+                    stats = auxiliary_stats[name]
+                    stats['loss_sum'] += values_aux.detach().sum().item()
+                    stats['correct'] += (auxiliary[name].detach().argmax(1) == target[av_mask]).sum().item()
+                    stats['total'] += len(values_aux)
                 pred = logits.detach().argmax(1).cpu().tolist()
                 probs = logits.detach().softmax(1).cpu().tolist()
                 values = batch_losses.detach().cpu().tolist()
@@ -342,6 +398,12 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
                        uar=float(recall_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0)),
                        macro_f1=float(f1_score(labels, predictions, labels=list(range(NUM_CLASSES)), average='macro', zero_division=0)),
                        confusion_matrix=confusion_matrix(labels, predictions, labels=list(range(NUM_CLASSES))).tolist())
+        if training and use_auxiliary:
+            metrics['objective_loss'] = objective_sum / len(labels)
+            metrics['auxiliary'] = {name: dict(loss=stats['loss_sum'] / stats['total'] if stats['total'] else None,
+                                               accuracy=stats['correct'] / stats['total'] if stats['total'] else None,
+                                               correct=stats['correct'], total=stats['total'], weight=aux_weights[name])
+                                    for name, stats in auxiliary_stats.items()}
         return metrics, records
 
     def save_predictions(path, records):
@@ -367,6 +429,19 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
         loaders['train'].dataset.epoch = epoch
         train_metrics, train_records = run_pass(loaders['train'], training=True)
         save_epoch(epoch+1, 'train', train_metrics, train_records, learning_rate)
+        if use_auxiliary:
+            path = output / 'auxiliary_metrics.csv'
+            exists = path.exists()
+            with path.open('a', newline='') as f:
+                fields = ['epoch', 'main_loss', 'objective_loss', 'aux_video_loss', 'aux_video_accuracy',
+                          'aux_video_total', 'aux_audio_loss', 'aux_audio_accuracy', 'aux_audio_total']
+                writer = csv.DictWriter(f, fieldnames=fields)
+                if not exists:
+                    writer.writeheader()
+                values = dict(epoch=epoch+1, main_loss=train_metrics['loss'], objective_loss=train_metrics['objective_loss'])
+                for name, stats in train_metrics['auxiliary'].items():
+                    values.update({'aux_' + name + '_' + key: stats[key] for key in ('loss', 'accuracy', 'total')})
+                writer.writerow(values)
         training_conditions = {}
         for condition in TEST_CONDITIONS:
             subset = [row for row in train_records if row['condition'] == condition]
@@ -405,6 +480,8 @@ def train(splits, args, output, model_factory=None, pretrained_loader=None):
         for term, attribute in (('video', 'wv'), ('audio', 'wa'), ('interaction', 'wf')):
             if term in model.logit_terms:
                 weights[attribute] = getattr(model, attribute).weight.detach().cpu().numpy()
+    if hasattr(model, 'aux_heads'):
+        weights.update({'aux_' + name: head.weight.detach().cpu().numpy() for name, head in model.aux_heads.items()})
     np.savez_compressed(output / 'classifier_weights.npz', **weights)
     summary = {}
     for condition in TEST_CONDITIONS:
@@ -456,6 +533,10 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
         parser.add_argument('--terms', '--heads', dest='terms', nargs='+',
                             choices=['visual', 'video', 'audio', 'interaction'], default=list(LOGIT_TERMS),
                             help='Terms to sum; visual aliases video. Default: visual interaction.')
+        parser.add_argument('--aux-video-weight', type=float, default=.5,
+                            help='Training-only visual CE weight on real AV examples; 0 disables (default .5)')
+        parser.add_argument('--aux-audio-weight', type=float, default=.5,
+                            help='Training-only audio CE weight on real AV examples; 0 disables (default .5)')
     args = parser.parse_args()
     args.training_conditions = list(TEST_CONDITIONS)
     args.logit_terms = list(logit_terms)
@@ -473,6 +554,10 @@ def main(model_factory=None, pretrained_loader=None, architecture='interaction',
             parser.error(str(error))
         args.logit_terms = list(args.terms)
     args.architecture = architecture
+    try:
+        auxiliary_weights(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.explain_limit < 0:
         parser.error('--explain-limit must be nonnegative')
     if args.epochs < 1 or args.batch_size < 1 or args.depth < 1 or args.lr <= 0:
