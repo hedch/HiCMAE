@@ -26,14 +26,14 @@ logits. Hidden MLP layers use GELU and dropout 0.1; the final linear layer has n
 softmax because training uses cross-entropy on logits.
 
 Indicators are NOT concatenated to the MLP input in new runs. The first hidden
-layer is permanently split into two equal neuron groups. The first half's incoming
-weights/biases are controlled by on_v and the second half's by on_a; the assignments
-never shuffle across epochs, batches or GPUs. The first hidden width must be even
-and at least 2, but subsequent layers can have any positive widths.
+layer is permanently split into two neuron groups. The first visual-gated group
+is controlled by on_v and the following audio-gated group by on_a. Assignments
+never shuffle across epochs, batches or GPUs. Group sizes are configurable and
+need not be equal; subsequent layers can have any positive widths.
 
 ## Training-only backward gating
 
-| Actual input condition | First-half gradient gate | Second-half gradient gate | Testing indicators |
+| Actual input condition | Visual-group gradient gate | Audio-group gradient gate | Testing indicators |
 | --- | --- | --- | --- |
 | Original video + original audio | 1 | 1 | Not supplied |
 | Original video + white-noise audio | 1 | 0 | Not supplied |
@@ -42,7 +42,7 @@ and at least 2, but subsequent layers can have any positive widths.
 The gates act on gradients immediately after the first hidden activation, using:
 
 ```
-g = concatenate(repeat(on_v, first_width/2), repeat(on_a, first_width/2))
+g = concatenate(repeat(on_v, N_visual), repeat(on_a, N_audio))
 h_gated = detach(h) + g * (h - detach(h))
 ```
 
@@ -58,7 +58,8 @@ group can therefore send gradients to both encoders. Only first-layer incoming
 weights/biases are subject to the strict inactive-group freezing rule. Frozen
 weights do not mean constant activations when the upstream encoders change.
 
-The two first-layer groups have separate parameter tensors. After backward, if
+The two first-layer groups have separate parameter tensors, including when their
+sizes differ. After backward, if
 NO example in the entire global minibatch enables a group, its parameter gradients
 are set to None before AdamW.step(). AdamW then skips that group entirely, including
 its weight decay, momentum and optimizer-state step. With mixed examples, an
@@ -115,6 +116,31 @@ The loss is ordinary six-class emotion cross-entropy over all presentations;
 training gates control which samples contribute first-layer gradients.
 AdamW and cosine learning-rate decay train both encoders, pooling weights, feature
 heads and MLP. The final epoch is saved; test accuracy does not select a checkpoint.
+
+## Choose visual-gated and audio-gated neuron counts
+
+Append these parameters to the usual command, for example:
+
+```text
+--visual-gated-neurons 192 --audio-gated-neurons 64
+```
+
+This creates a first hidden layer of 256 neurons: fixed indices 0–191 are visual-gated and 192–255 are audio-gated. Both groups must have positive integer sizes.
+The default remains 128 visual-gated and 128 audio-gated neurons.
+
+- If BOTH counts are supplied, their sum overrides the first entry of
+  `--mlp-hidden-dims`; subsequent hidden widths are unchanged. For example, counts
+  64 and 32 with `--mlp-hidden-dims 256 128` produce hidden widths 96 and 128.
+- If ONE count is supplied, the other is the remainder of the requested first
+  hidden width. For example, `--visual-gated-neurons 160` with the default first
+  width 256 gives 160 visual-gated and 96 audio-gated neurons.
+- If NEITHER count is supplied, the first hidden width is divided equally and
+  must be even. Explicit group sizes can produce an odd total width.
+
+Config saves the resolved counts, actual hidden widths and fixed index ranges
+(start-inclusive, end-exclusive). New unequal-group checkpoints reconstruct from
+these saved settings; older equal-group checkpoints still infer their original
+half sizes. Changing group sizes requires retraining in a new output folder.
 
 ## Initialization and running
 
@@ -195,7 +221,7 @@ Reference: [PyTorch DataParallel documentation](https://docs.pytorch.org/docs/st
 ## Saved results and explanations
 
 - `config.json`: architecture, initialization, MLP settings,
-  `mlp_input_mode=gradient_gated`, the fixed half assignments and training gates.
+  `mlp_input_mode=gradient_gated`, the resolved gated-neuron counts, fixed index ranges and training gates.
   `test_indicators` is null.
 - `train.csv`, `test.csv`, `split_report.json`: underlying trial manifests/counts.
 - `train_expanded.csv`: condition-specific training rows with on_v/on_a.
@@ -243,6 +269,6 @@ no meaningful classifier accuracy.
 Tests cover independent import/preparation with no other runner files, balanced
 and disjoint data splits, exact indicator policies, configuration/manifest exports,
 and numerical single-output analysis. Optional PyTorch tests cover concatenation,
-backward-only sample masks, fixed group assignments, exact inactive-half AdamW
+backward-only sample masks, fixed group assignments, exact inactive-group AdamW
 parameter/state freezing, checkpoint loading and indicator-free testing. Full GPU/media training requires the user's
 PyTorch environment and dataset.
