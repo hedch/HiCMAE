@@ -1,4 +1,4 @@
-"""Standalone RAVDESS training: video/audio feature heads + indicators + MLP.
+"""Standalone RAVDESS training: video/audio features + fixed first-layer gradient gates.
 
 Random initialization by default; --checkpoint optionally initializes encoders.
 No dependency on another experiment runner. --prepare-only needs only stdlib.
@@ -65,6 +65,12 @@ def indicators_for_conditions(conditions, training, test_policy=None):
     policy = TEST_INDICATORS if test_policy is None else test_policy
     return [list(available[condition] if training else policy[condition] if isinstance(policy, dict) else policy)
             for condition in conditions]
+
+
+def first_layer_half_width(width):
+    if width < 2 or width % 2:
+        raise ValueError('The first MLP hidden width must be even and at least 2 for fixed half-neuron gating')
+    return width // 2
 
 
 def discover(video_root, audio_root):
@@ -275,8 +281,10 @@ def make_model(args):
 
         def __init__(self):
             super().__init__()
-            # Legacy checkpoints saved one shared [1,1] pair; preserve that policy.
-            self.test_indicators = getattr(args, 'test_indicators', [1, 1])
+            self.gradient_gating = getattr(args, 'mlp_input_mode', 'concat_indicators') == 'gradient_gated'
+            if not self.gradient_gating:
+                # Retain the old architecture only for loading previous runs.
+                self.test_indicators = getattr(args, 'test_indicators', [1, 1])
             backbone = AudioVisionTransformer(
                 img_size=160, patch_size=16, embed_dim=args.embed_dim,
                 num_heads=args.embed_dim // 64, depth=args.depth,
@@ -291,15 +299,40 @@ def make_model(args):
             def feature_head():
                 return nn.Sequential(nn.LayerNorm(args.embed_dim), nn.Linear(args.embed_dim, args.head_dim), nn.GELU())
             self.video_head, self.audio_head = feature_head(), feature_head()
-            layers, width = [], 2 * args.head_dim + 2
-            for hidden in args.mlp_hidden_dims:
-                layers.extend([nn.Linear(width, hidden), nn.GELU(), nn.Dropout(args.mlp_dropout)])
+            layers, width = [], 2 * args.head_dim + (0 if self.gradient_gating else 2)
+            for index, hidden in enumerate(args.mlp_hidden_dims):
+                if self.gradient_gating and index == 0:
+                    half = first_layer_half_width(hidden)
+                    class FixedHalves(nn.Module):
+                        def __init__(self, inputs, half_width):
+                            super().__init__()
+                            # Separate parameters allow AdamW to skip a wholly
+                            # inactive group, including momentum and weight decay.
+                            self.visual = nn.Linear(inputs, half_width)
+                            self.audio = nn.Linear(inputs, half_width)
+                        def forward(self, features):
+                            return torch.cat((self.visual(features), self.audio(features)), dim=-1)
+                    linear = FixedHalves(width, half)
+                else:
+                    linear = nn.Linear(width, hidden)
+                layers.extend([linear, nn.GELU(), nn.Dropout(args.mlp_dropout)])
                 width = hidden
             layers.append(nn.Linear(width, NUM_CLASSES))
             self.classifier = nn.Sequential(*layers)
 
         def indicators_for_test_condition(self, condition):
+            if self.gradient_gating:
+                return None
             return indicators_for_conditions([condition], False, self.test_indicators)[0]
+
+        def prepare_gradient_gate_step(self, indicators):
+            """Use GLOBAL batch eligibility, after DataParallel gradient reduction."""
+            if self.gradient_gating:
+                active = indicators.detach().bool().any(dim=0).tolist()
+                for enabled, half in zip(active, (self.classifier[0].visual, self.classifier[0].audio)):
+                    if not enabled:
+                        for parameter in half.parameters():
+                            parameter.grad = None
 
         def forward(self, video, audio, indicators=None, return_terms=False):
             v = self.encoder(video).mean(1)
@@ -307,15 +340,25 @@ def make_model(args):
             ov = (v * self.video_layer_weights.softmax(0)[None, :, None]).sum(1)
             oa = (a * self.audio_layer_weights.softmax(0)[None, :, None]).sum(1)
             hv, ha = self.video_head(ov), self.audio_head(oa)
-            if indicators is None:
+            if self.training or not self.gradient_gating:
+                if indicators is None:
+                    if self.training:
+                        raise ValueError('Training requires explicit on_v/on_a indicators')
+                    indicators = hv.new_ones((len(hv), 2))
+                indicators = torch.as_tensor(indicators, dtype=hv.dtype, device=hv.device)
+                if indicators.shape != (len(hv), 2) or not ((indicators == 0) | (indicators == 1)).all():
+                    raise ValueError('Indicators must be a B-by-2 tensor of zeros/ones ordered [on_v, on_a]')
+            if self.gradient_gating:
+                hidden = self.classifier[1](self.classifier[0](torch.cat((hv, ha), dim=-1)))
                 if self.training:
-                    raise ValueError('Training requires explicit on_v/on_a indicators')
-                indicators = hv.new_ones((len(hv), 2))
-            indicators = torch.as_tensor(indicators, dtype=hv.dtype, device=hv.device)
-            if indicators.shape != (len(hv), 2) or not ((indicators == 0) | (indicators == 1)).all():
-                raise ValueError('Indicators must be a B-by-2 tensor of zeros/ones ordered [on_v, on_a]')
-            # Concatenation only: do not multiply/gate features by these bits.
-            logits = self.classifier(torch.cat((hv, ha, indicators), dim=-1))
+                    gate = indicators.repeat_interleave(hidden.shape[-1] // 2, dim=-1)
+                    # Identity in the forward pass; only incoming gradients are gated.
+                    hidden = hidden.detach() + gate * (hidden - hidden.detach())
+                for layer in list(self.classifier.children())[2:]:
+                    hidden = layer(hidden)
+                logits = hidden
+            else:
+                logits = self.classifier(torch.cat((hv, ha, indicators), dim=-1))
             return (logits, (logits,)) if return_terms else logits
 
     return IndicatorMLP()
@@ -375,6 +418,7 @@ def train(splits, args, output):
     else:
         print('Training both encoders, feature heads and MLP from random initialization.')
     model, parallelism = configure_parallel_model(raw_model, args)
+    gradient_gating = getattr(raw_model, 'gradient_gating', False)
     device = torch.device(args.device)
     (output / 'parallelism.json').write_text(json.dumps(parallelism, indent=2))
     loaders = make_loaders(splits, args)
@@ -391,9 +435,11 @@ def train(splits, args, output):
                 index_list = indices.tolist()
                 rows = [loader.dataset.rows[index] for index in index_list]
                 conditions = [row.get('condition', loader.dataset.condition) for row in rows]
-                bits = indicators_for_conditions(conditions, training, getattr(args, 'test_indicators', TEST_INDICATORS))
-                indicators = torch.tensor(bits, device=device, dtype=torch.float32)
-                logits, terms = model(video.to(device), audio.to(device), indicators=indicators, return_terms=True)
+                bits = (indicators_for_conditions(conditions, training, getattr(args, 'test_indicators', TEST_INDICATORS))
+                        if training or not gradient_gating else None)
+                indicators = torch.tensor(bits, device=device, dtype=torch.float32) if bits is not None else None
+                forward_args = dict(indicators=indicators) if indicators is not None else {}
+                logits, terms = model(video.to(device), audio.to(device), return_terms=True, **forward_args)
                 torch.testing.assert_close(logits, sum(terms))
                 losses = torch.nn.functional.cross_entropy(logits, label.to(device), reduction='none')
                 loss = losses.mean()
@@ -402,6 +448,8 @@ def train(splits, args, output):
                 if training:
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
+                    if gradient_gating:
+                        raw_model.prepare_gradient_gate_step(indicators)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
                     optimizer.step()
                 predictions = logits.detach().argmax(1).cpu().tolist()
@@ -416,7 +464,8 @@ def train(splits, args, output):
                     target = int(label[i].item())
                     record = dict(video=row['video'], actor=row['actor'], condition=conditions[i],
                                   neutral_video=row.get('neutral_video', ''), noise_seed=noise_seed,
-                                  available_v=available[0], available_a=available[1], on_v=bits[i][0], on_a=bits[i][1],
+                                  available_v=available[0], available_a=available[1],
+                                  on_v=bits[i][0] if bits is not None else '', on_a=bits[i][1] if bits is not None else '',
                                   label=target, prediction=predictions[i], correct=int(target == predictions[i]), loss=loss_values[i])
                     for j, emotion in enumerate(EMOTIONS):
                         record['p_' + emotion] = probabilities[i][j]
@@ -472,7 +521,8 @@ def train(splits, args, output):
                    initialization='pretrained_encoders' if args.checkpoint else 'random',
                    checkpoint_epoch=args.epochs, checkpoint_file='final.pth', checkpoint_selection='final_epoch',
                    parallelism=parallelism,
-                   test_indicators=getattr(args, 'test_indicators', TEST_INDICATORS), conditions=final)
+                   mlp_input_mode=getattr(args, 'mlp_input_mode', 'concat_indicators'),
+                   test_indicators=None if gradient_gating else getattr(args, 'test_indicators', TEST_INDICATORS), conditions=final)
     (output / 'test_metrics.json').write_text(json.dumps(summary, indent=2))
     if not args.skip_explanations:
         from video_loss_explanations import export_test_explanations
@@ -513,6 +563,10 @@ def main():
         parser.error(str(error))
     if min(args.epochs, args.batch_size, args.depth, args.head_dim, *args.mlp_hidden_dims) < 1:
         parser.error('Epochs, batch size, depth and MLP dimensions must be positive')
+    try:
+        first_layer_half_width(args.mlp_hidden_dims[0])
+    except ValueError as error:
+        parser.error(str(error))
     if not math.isfinite(args.lr) or args.lr <= 0 or not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error('Learning rate must be finite/positive; weight decay finite/nonnegative')
     if any(not math.isfinite(value) or not 0 <= value < 1 for value in (args.mlp_dropout, args.drop_path)):
@@ -525,7 +579,9 @@ def main():
     args.testing_audio_only_visual = 'neutral'
     args.training_conditions = list(TEST_CONDITIONS)
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
-    args.test_indicators = {condition: list(bits) for condition, bits in TEST_INDICATORS.items()}
+    args.mlp_input_mode = 'gradient_gated'
+    args.test_indicators = None
+    args.first_layer_gate_assignment = dict(visual='first_half', audio='second_half', fixed=True)
     args.initialization = 'pretrained_encoders' if args.checkpoint else 'random'
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
