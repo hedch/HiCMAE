@@ -87,15 +87,16 @@ class VideoAttentionCapture:
         self.records.clear()
 
 
-def explain_video_loss(model, video, audio, label):
+def explain_video_loss(model, video, audio, label, indicators=None):
     """Explain one trial; return signed layer/tubelet maps plus prediction metadata."""
     if model.training or video.shape[0] != 1:
         raise ValueError('Explanation requires eval mode and a single trial.')
+    model_kwargs = {} if indicators is None else dict(indicators=video.new_tensor([indicators]))
     with torch.no_grad():
-        original_logits = model(video, audio)
+        original_logits = model(video, audio, **model_kwargs)
     with torch.enable_grad(), VideoAttentionCapture(model.encoder) as capture:
         video = video.detach().requires_grad_(True)
-        logits = model(video, audio.detach())
+        logits = model(video, audio.detach(), **model_kwargs)
         torch.testing.assert_close(logits.detach(), original_logits, rtol=1e-5, atol=1e-6)
         loss = F.cross_entropy(logits, label)
         records = [capture.records[i] for i in sorted(capture.records)]
@@ -121,7 +122,10 @@ def explain_video_loss(model, video, audio, label):
                             logits=logits[0].detach().cpu().tolist(),
                             forward_max_abs_error=(logits.detach()-original_logits).abs().max().item())
             if hasattr(model, 'test_indicators'):
-                metadata.update(on_v=int(model.test_indicators[0]), on_a=int(model.test_indicators[1]))
+                bits = indicators if indicators is not None else model.test_indicators
+                if isinstance(bits, dict):
+                    bits = bits['both']
+                metadata.update(on_v=int(bits[0]), on_a=int(bits[1]))
             return signed.cpu(), layers.cpu(), metadata
 
 
@@ -147,9 +151,10 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
         results = {}
         for condition in conditions:
             video, audio, label, sample_index = loaders['test_' + condition].dataset[index]
+            bits = model.indicators_for_test_condition(condition) if hasattr(model, 'indicators_for_test_condition') else None
             signed, layers, metadata = explain_video_loss(
                 model, video[None].to(device), audio[None].to(device),
-                torch.tensor([label], device=device))
+                torch.tensor([label], device=device), indicators=bits)
             results[condition] = (video, signed, layers, metadata)
         scale = max(float(item[1].clamp_min(0).max()) for item in results.values())
         for condition, (video, signed, layers, metadata) in results.items():
