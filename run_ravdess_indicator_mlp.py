@@ -73,6 +73,19 @@ def first_layer_half_width(width):
     return width // 2
 
 
+def first_layer_gate_sizes(width, visual=None, audio=None):
+    """Both supplied: their sum sets width; one supplied: infer the remainder."""
+    if visual is None and audio is None:
+        visual = audio = first_layer_half_width(width)
+    elif visual is None:
+        visual = width - audio
+    elif audio is None:
+        audio = width - visual
+    if any(type(value) is not int or value < 1 for value in (visual, audio)):
+        raise ValueError('Visual/audio gated neuron counts must both be positive integers')
+    return visual, audio
+
+
 def discover(video_root, audio_root):
     """Pair speech MP4s with WAVs using the six non-modality filename fields."""
     audios = {}
@@ -313,20 +326,24 @@ def make_model(args):
             def feature_head():
                 return nn.Sequential(nn.LayerNorm(args.embed_dim), nn.Linear(args.embed_dim, args.head_dim), nn.GELU())
             self.video_head, self.audio_head = feature_head(), feature_head()
+            hidden_dims = list(args.mlp_hidden_dims)
+            if self.gradient_gating:
+                self.visual_gated_neurons, self.audio_gated_neurons = first_layer_gate_sizes(
+                    hidden_dims[0], getattr(args, 'visual_gated_neurons', None), getattr(args, 'audio_gated_neurons', None))
+                hidden_dims[0] = self.visual_gated_neurons + self.audio_gated_neurons
             layers, width = [], 2 * args.head_dim + (0 if self.gradient_gating else 2)
-            for index, hidden in enumerate(args.mlp_hidden_dims):
+            for index, hidden in enumerate(hidden_dims):
                 if self.gradient_gating and index == 0:
-                    half = first_layer_half_width(hidden)
-                    class FixedHalves(nn.Module):
-                        def __init__(self, inputs, half_width):
+                    class FixedGroups(nn.Module):
+                        def __init__(self, inputs, visual_width, audio_width):
                             super().__init__()
                             # Separate parameters allow AdamW to skip a wholly
                             # inactive group, including momentum and weight decay.
-                            self.visual = nn.Linear(inputs, half_width)
-                            self.audio = nn.Linear(inputs, half_width)
+                            self.visual = nn.Linear(inputs, visual_width)
+                            self.audio = nn.Linear(inputs, audio_width)
                         def forward(self, features):
                             return torch.cat((self.visual(features), self.audio(features)), dim=-1)
-                    linear = FixedHalves(width, half)
+                    linear = FixedGroups(width, self.visual_gated_neurons, self.audio_gated_neurons)
                 else:
                     linear = nn.Linear(width, hidden)
                 layers.extend([linear, nn.GELU(), nn.Dropout(args.mlp_dropout)])
@@ -365,7 +382,8 @@ def make_model(args):
             if self.gradient_gating:
                 hidden = self.classifier[1](self.classifier[0](torch.cat((hv, ha), dim=-1)))
                 if self.training:
-                    gate = indicators.repeat_interleave(hidden.shape[-1] // 2, dim=-1)
+                    gate = torch.cat((indicators[:, :1].expand(-1, self.visual_gated_neurons),
+                                      indicators[:, 1:2].expand(-1, self.audio_gated_neurons)), dim=-1)
                     # Identity in the forward pass; only incoming gradients are gated.
                     hidden = hidden.detach() + gate * (hidden - hidden.detach())
                 for layer in list(self.classifier.children())[2:]:
@@ -560,6 +578,10 @@ def main():
     parser.add_argument('--depth', type=int, default=10)
     parser.add_argument('--head-dim', type=int, default=256)
     parser.add_argument('--mlp-hidden-dims', nargs='+', type=int, default=[256, 128])
+    parser.add_argument('--visual-gated-neurons', type=int,
+                        help='First-layer visual-gated count; defaults to half, or remainder if only audio count supplied')
+    parser.add_argument('--audio-gated-neurons', type=int,
+                        help='First-layer audio-gated count; both counts supplied override the first hidden width')
     parser.add_argument('--mlp-dropout', type=float, default=.1)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=4)
@@ -581,7 +603,9 @@ def main():
     if min(args.epochs, args.batch_size, args.depth, args.head_dim, *args.mlp_hidden_dims) < 1:
         parser.error('Epochs, batch size, depth and MLP dimensions must be positive')
     try:
-        first_layer_half_width(args.mlp_hidden_dims[0])
+        args.visual_gated_neurons, args.audio_gated_neurons = first_layer_gate_sizes(
+            args.mlp_hidden_dims[0], args.visual_gated_neurons, args.audio_gated_neurons)
+        args.mlp_hidden_dims[0] = args.visual_gated_neurons + args.audio_gated_neurons
     except ValueError as error:
         parser.error(str(error))
     if not math.isfinite(args.lr) or args.lr <= 0 or not math.isfinite(args.weight_decay) or args.weight_decay < 0:
@@ -599,7 +623,9 @@ def main():
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
     args.mlp_input_mode = 'gradient_gated'
     args.test_indicators = None
-    args.first_layer_gate_assignment = dict(visual='first_half', audio='second_half', fixed=True)
+    args.first_layer_gate_assignment = dict(visual=[0, args.visual_gated_neurons],
+                                           audio=[args.visual_gated_neurons, args.mlp_hidden_dims[0]],
+                                           ranges='start_inclusive_end_exclusive', fixed=True)
     args.initialization = 'pretrained_encoders' if args.checkpoint else 'random'
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
