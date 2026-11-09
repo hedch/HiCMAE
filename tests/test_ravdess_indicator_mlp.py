@@ -14,6 +14,22 @@ import run_ravdess_indicator_mlp as experiment
 
 
 class IndicatorDataTests(unittest.TestCase):
+    def test_actor_split_incomplete_data_and_rejections(self):
+        rows = [dict(video=f'{actor}-{label}-{trial}', audio='audio', actor=actor, label=label)
+                for actor in range(1, 25) for label in range(6) for trial in range(8)]
+        _, baseline = experiment.balanced_split(rows, 42)
+        held_out = baseline['test']['actors'][0]
+        incomplete = [row for row in rows if row['video'] != f'{held_out}-0-0']
+        splits, report = experiment.balanced_split(incomplete, 42)
+        self.assertEqual(report['train']['balanced_counts'], [160]*6)
+        self.assertEqual(report['test']['balanced_counts'], [31]*6)
+        self.assertEqual(report['test']['unused_counts'], [0, 1, 1, 1, 1, 1])
+        self.assertFalse({row['actor'] for row in splits['train']} & {row['actor'] for row in splits['test']})
+        for invalid in (rows + [rows[0]], [row for row in rows if row['actor'] != 24],
+                        [row for row in rows if row['label'] != 0]):
+            with self.assertRaises(ValueError):
+                experiment.balanced_split(invalid, 42)
+
     def test_training_and_testing_indicators(self):
         self.assertEqual(experiment.indicators_for_conditions(experiment.TEST_CONDITIONS, True),
                          [[1, 1], [1, 0], [0, 1]])
@@ -31,12 +47,17 @@ class IndicatorDataTests(unittest.TestCase):
         rows = [dict(video=f'{actor}-{label}-{trial}', audio='audio', actor=actor, label=label)
                 for actor in range(1, 25) for label in range(6) for trial in range(8)]
         splits, report = experiment.balanced_split(rows, 42)
-        self.assertEqual([len(splits[name]) for name in ('train', 'test')], [768, 384])
+        self.assertEqual([len(splits[name]) for name in ('train', 'test')], [960, 192])
         self.assertFalse({r['video'] for r in splits['train']} & {r['video'] for r in splits['test']})
+        self.assertFalse({r['actor'] for r in splits['train']} & {r['actor'] for r in splits['test']})
+        self.assertEqual([len(report[name]['actors']) for name in ('train', 'test')], [20, 4])
+        self.assertEqual((splits, report), experiment.balanced_split(rows, 42))
+        self.assertNotEqual(report['test']['actors'], experiment.balanced_split(rows, 43)[1]['test']['actors'])
+        self.assertEqual(report['test']['balanced_counts'], [32]*6)
         expanded = experiment.expand_training_rows(splits['train'])
-        self.assertEqual(len(expanded), 2304)
+        self.assertEqual(len(expanded), 2880)
         for condition in experiment.TEST_CONDITIONS:
-            self.assertEqual([sum(r['condition']==condition and r['label']==label for r in expanded) for label in range(6)], [128]*6)
+            self.assertEqual([sum(r['condition']==condition and r['label']==label for r in expanded) for label in range(6)], [160]*6)
 
     def test_prepare_runs_with_only_the_standalone_script(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -60,11 +81,21 @@ class IndicatorDataTests(unittest.TestCase):
             config = json.loads((output/'config.json').read_text())
             self.assertEqual(config['architecture'], 'indicator_mlp')
             self.assertEqual(config['initialization'], 'random')
+            self.assertEqual(config['split_method'], 'actor_disjoint_20_4')
+            self.assertEqual(len(config['train_actors']), 20)
+            self.assertEqual(len(config['test_actors']), 4)
+            self.assertFalse(set(config['train_actors']) & set(config['test_actors']))
+            for name in ('train', 'test'):
+                with (output/(name+'.csv')).open() as f:
+                    manifest = list(csv.DictReader(f))
+                self.assertEqual({int(row['actor']) for row in manifest}, set(config[name+'_actors']))
+                for row in manifest:
+                    self.assertEqual(int(Path(row['neutral_video']).stem.split('-')[-1]), int(row['actor']))
             self.assertEqual(config['test_indicators'], [1, 1])
             self.assertEqual(config['neutral_frame_policy'], 'first')
             with (output/'train_expanded.csv').open() as f:
                 expanded = list(csv.DictReader(f))
-            self.assertEqual(len(expanded), 2304)
+            self.assertEqual(len(expanded), 2880)
             for row in expanded:
                 expected = experiment.indicators_for_conditions([row['condition']], True)[0]
                 self.assertEqual([int(row['on_v']), int(row['on_a'])], expected)
