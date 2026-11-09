@@ -14,6 +14,17 @@ import run_ravdess_indicator_mlp as experiment
 
 
 class IndicatorDataTests(unittest.TestCase):
+    def test_three_condition_groups(self):
+        self.assertEqual(experiment.condition_gate_sizes(), {'av': 128, 'visual': 64, 'audio': 64})
+        self.assertEqual(experiment.condition_gate_sizes(5, 7, 9), {'av': 5, 'visual': 7, 'audio': 9})
+        self.assertEqual(experiment.condition_group_gates([[1, 1], [1, 0], [0, 1]]),
+                         [[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        with self.assertRaises(ValueError):
+            experiment.condition_group_gates([[0, 0]])
+        for counts in ((0, 64, 64), (128, -1, 64), (128, 64, 0)):
+            with self.assertRaises(ValueError):
+                experiment.condition_gate_sizes(*counts)
+
     def test_fixed_first_layer_partition_dimensions(self):
         self.assertEqual(experiment.first_layer_half_width(256), 128)
         sizes = experiment.first_layer_gate_sizes
@@ -125,9 +136,9 @@ class IndicatorDataTests(unittest.TestCase):
                 for row in manifest:
                     self.assertEqual(int(Path(row['neutral_video']).stem.split('-')[-1]), int(row['actor']))
             self.assertIsNone(config['test_indicators'])
-            self.assertEqual(config['mlp_input_mode'], 'gradient_gated')
+            self.assertEqual(config['mlp_input_mode'], 'condition_gradient_gated')
             self.assertTrue(config['first_layer_gate_assignment']['fixed'])
-            self.assertEqual([config['visual_gated_neurons'], config['audio_gated_neurons']], [128, 128])
+            self.assertEqual([config['av_gated_neurons'], config['visual_gated_neurons'], config['audio_gated_neurons']], [128, 64, 64])
             self.assertEqual(config['neutral_frame_policy'], 'first')
             with (output/'train_expanded.csv').open() as f:
                 expanded = list(csv.DictReader(f))
@@ -137,33 +148,99 @@ class IndicatorDataTests(unittest.TestCase):
                 self.assertEqual([int(row['on_v']), int(row['on_a'])], expected)
             for option in (['--head-dim', '0'], ['--lr', 'nan'], ['--mlp-dropout', '1'],
                            ['--gpu-ids', '0', '0'], ['--device', 'cpu', '--gpu-ids', '1'],
-                           ['--mlp-hidden-dims', '255', '128'], ['--visual-gated-neurons', '0'],
-                           ['--audio-gated-neurons', '-1'], ['--visual-gated-neurons', '256']):
+                           ['--av-gated-neurons', '0'], ['--visual-gated-neurons', '0'],
+                           ['--audio-gated-neurons', '-1']):
                 failed = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
                                          '--prepare-only', *option], cwd=root, capture_output=True, text=True)
                 self.assertEqual(failed.returncode, 2)
             for i, (options, expected) in enumerate((
-                    (['--visual-gated-neurons', '192', '--audio-gated-neurons', '64'], [192, 64]),
-                    (['--visual-gated-neurons', '32', '--audio-gated-neurons', '64'], [32, 64]),
-                    (['--visual-gated-neurons', '160'], [160, 96]),
-                    (['--audio-gated-neurons', '160'], [96, 160]),
-                    (['--visual-gated-neurons', '5', '--audio-gated-neurons', '8'], [5, 8]))):
+                    (['--av-gated-neurons', '96', '--visual-gated-neurons', '80', '--audio-gated-neurons', '48'], [96, 80, 48]),
+                    (['--av-gated-neurons', '64'], [64, 64, 64]),
+                    (['--visual-gated-neurons', '160'], [128, 160, 64]),
+                    (['--audio-gated-neurons', '160'], [128, 64, 160]),
+                    (['--va-gated-neurons', '5', '--visual-gated-neurons', '7', '--audio-gated-neurons', '9'], [5, 7, 9]))):
                 custom = root / ('custom%d' % i)
                 result = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
                                          '--output-dir', str(custom), '--prepare-only', *options],
                                         cwd=root, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 custom_config = json.loads((custom/'config.json').read_text())
-                self.assertEqual([custom_config['visual_gated_neurons'], custom_config['audio_gated_neurons']], expected)
+                self.assertEqual([custom_config['av_gated_neurons'], custom_config['visual_gated_neurons'], custom_config['audio_gated_neurons']], expected)
                 self.assertEqual(custom_config['mlp_hidden_dims'], [sum(expected), 128])
-                self.assertEqual(custom_config['first_layer_gate_assignment']['visual'], [0, expected[0]])
-                self.assertEqual(custom_config['first_layer_gate_assignment']['audio'], [expected[0], sum(expected)])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['av'], [0, expected[0]])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['visual'], [expected[0], expected[0]+expected[1]])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['audio'], [expected[0]+expected[1], sum(expected)])
                 self.assertEqual((custom/'train.csv').read_text(), (output/'train.csv').read_text())
                 self.assertEqual((custom/'test.csv').read_text(), (output/'test.csv').read_text())
 
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Requires PyTorch')
 class IndicatorModelTests(unittest.TestCase):
+    def test_three_groups_masks_and_adamw_freezing(self):
+        import torch
+        nn = torch.nn
+        class Encoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(1, 3, 1, 384))
+            def forward(self, x):
+                return self.weight.expand(len(x), -1, -1, -1)
+        def backbone(**kwargs):
+            return SimpleNamespace(encoder=Encoder(), encoder_audio=Encoder(),
+                                   video_layer_weights=nn.Parameter(torch.ones(1)), audio_layer_weights=nn.Parameter(torch.ones(1)))
+        args = SimpleNamespace(embed_dim=384, depth=1, drop_path=0., head_dim=8,
+                               mlp_hidden_dims=[256, 7], mlp_dropout=0., mlp_input_mode='condition_gradient_gated',
+                               av_gated_neurons=3, visual_gated_neurons=5, audio_gated_neurons=7)
+        with patch.dict('sys.modules', {'modeling_finetune_av': SimpleNamespace(AudioVisionTransformer=backbone)}):
+            model = experiment.make_model(args)
+            restored = experiment.make_model(args).eval()
+        self.assertEqual(model.gate_group_sizes, {'av': 3, 'visual': 5, 'audio': 7})
+        first = model.classifier[0]
+        self.assertEqual([getattr(first, name).out_features for name in first.order], [3, 5, 7])
+        video, audio = torch.ones(3, 1), torch.ones(3, 1)
+        bits = torch.tensor([[1., 1.], [1., 0.], [0., 1.]])
+        captured = []
+        def capture(module, inputs, output):
+            output.retain_grad()
+            captured.append(output)
+        handle = model.classifier[1].register_forward_hook(capture)
+        logits = model(video, audio, indicators=bits)
+        hidden = captured[-1]
+        torch.testing.assert_close(logits, model(video, audio, indicators=bits.flip(0)))
+        logits.sum().backward()
+        mask = torch.zeros(3, 15, dtype=torch.bool)
+        mask[0, :3], mask[1, 3:8], mask[2, 8:] = True, True, True
+        self.assertEqual(hidden.grad[~mask].abs().sum().item(), 0)
+        self.assertGreater(hidden.grad[mask].abs().sum().item(), 0)
+        handle.remove()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.01, weight_decay=.2)
+        def step(indicators):
+            optimizer.zero_grad(set_to_none=True)
+            nn.functional.cross_entropy(model(video, audio, indicators=indicators), torch.tensor([0, 1, 2])).backward()
+            model.prepare_gradient_gate_step(indicators)
+            optimizer.step()
+        step(bits)
+        for active, flags in zip(first.order, ([1., 1.], [1., 0.], [0., 1.])):
+            inactive = [parameter for name in first.order if name != active for parameter in getattr(first, name).parameters()]
+            before = {parameter: (parameter.detach().clone(),
+                {key: value.clone() if torch.is_tensor(value) else value for key, value in optimizer.state[parameter].items()})
+                for parameter in inactive}
+            step(torch.tensor([flags]*3))
+            for parameter, (weights, state) in before.items():
+                self.assertIsNone(parameter.grad)
+                torch.testing.assert_close(parameter, weights, rtol=0, atol=0)
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        torch.testing.assert_close(optimizer.state[parameter][key], value, rtol=0, atol=0)
+                    else:
+                        self.assertEqual(optimizer.state[parameter][key], value)
+            self.assertIsNotNone(getattr(first, active).weight.grad)
+            self.assertIsNotNone(model.classifier[-1].weight.grad)
+        model.eval()
+        restored.load_state_dict(model.state_dict(), strict=True)
+        torch.testing.assert_close(model(video, audio), restored(video, audio))
+        self.assertIsNone(model.indicators_for_test_condition('both'))
+
     def test_fixed_backward_only_gates_and_adamw_inactive_half_freeze(self):
         import torch
         nn = torch.nn
@@ -320,6 +397,9 @@ class IndicatorTrainerTests(unittest.TestCase):
     def test_gradient_gated_training_and_indicator_free_testing(self):
         self.check_training_outputs(True)
 
+    def test_three_condition_training_records(self):
+        self.check_training_outputs('three')
+
     def check_training_outputs(self, gated):
         import io
         from contextlib import redirect_stdout
@@ -340,6 +420,7 @@ class IndicatorTrainerTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.gradient_gating = gated
+                self.condition_gradient_gating = gated == 'three'
                 self.classifier = nn.Linear(12 if gated else 14, 6)
             def prepare_gradient_gate_step(self, indicators):
                 if indicators is None:
@@ -361,7 +442,8 @@ class IndicatorTrainerTests(unittest.TestCase):
         args = SimpleNamespace(seed=42, device='cpu', checkpoint=None, lr=.001, weight_decay=.05, epochs=2,
                                skip_epoch_tests=False, skip_explanations=True)
         if gated:
-            args.mlp_input_mode, args.test_indicators = 'gradient_gated', None
+            args.mlp_input_mode = 'condition_gradient_gated' if gated == 'three' else 'gradient_gated'
+            args.test_indicators = None
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             with patch.object(experiment, 'make_model', return_value=Model()), \
@@ -374,12 +456,17 @@ class IndicatorTrainerTests(unittest.TestCase):
             self.assertEqual(len(rows), 18)
             for row in rows:
                 self.assertEqual([int(row['on_v']), int(row['on_a'])], experiment.indicators_for_conditions([row['condition']], True)[0])
+                if gated == 'three':
+                    self.assertEqual(row['gradient_gate_group'],
+                                     {'both': 'av', 'video_noise': 'visual', 'audio_neutral': 'audio'}[row['condition']])
             for condition in experiment.TEST_CONDITIONS:
                 with (output/('test_predictions_'+condition+'.csv')).open() as f:
                     rows = list(csv.DictReader(f))
                 expected = ('', '') if gated else tuple(str(bit) for bit in experiment.TEST_INDICATORS[condition])
                 self.assertEqual({(row['on_v'], row['on_a']) for row in rows}, {expected})
                 for row in rows:
+                    if gated == 'three':
+                        self.assertEqual(row['gradient_gate_group'], '')
                     self.assertEqual([int(row['available_v']), int(row['available_a'])],
                                      experiment.indicators_for_conditions([condition], True)[0])
                     for emotion in experiment.EMOTIONS:
