@@ -14,6 +14,18 @@ import run_ravdess_indicator_mlp as experiment
 
 
 class IndicatorDataTests(unittest.TestCase):
+    def test_gpu_selection_and_validation(self):
+        resolve = experiment.resolve_gpu_selection
+        self.assertEqual(resolve('cuda', [0, 1, 2, 3], 4), ('cuda:0', [0, 1, 2, 3]))
+        self.assertEqual(resolve('cuda', [2], 4), ('cuda:2', [2]))
+        self.assertEqual(resolve('cuda:3', None, 4), ('cuda:3', [3]))
+        self.assertEqual(resolve('cuda:3', [2, 0], 4), ('cuda:2', [2, 0]))
+        self.assertEqual(resolve('cpu', None, 0), ('cpu', []))
+        for device, ids, count in (('cuda', [0, 0], 4), ('cuda', [-1], 4), ('cuda', [4], 4),
+                                    ('cuda', [0], 0), ('cpu', [0], 4), ('cuda:bad', None, 4)):
+            with self.assertRaises(ValueError):
+                resolve(device, ids, count)
+
     def test_actor_split_incomplete_data_and_rejections(self):
         rows = [dict(video=f'{actor}-{label}-{trial}', audio='audio', actor=actor, label=label)
                 for actor in range(1, 25) for label in range(6) for trial in range(8)]
@@ -78,10 +90,13 @@ class IndicatorDataTests(unittest.TestCase):
                                 (audio / (stem+'.wav')).touch()
             output = root / 'run'
             result = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
-                                     '--output-dir', str(output), '--prepare-only'], cwd=root, capture_output=True, text=True)
+                                     '--output-dir', str(output), '--prepare-only', '--gpu-ids', '0', '1', '2', '3',
+                                     '--batch-size', '16'], cwd=root, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             config = json.loads((output/'config.json').read_text())
             self.assertEqual(config['architecture'], 'indicator_mlp')
+            self.assertEqual(config['gpu_ids'], [0, 1, 2, 3])
+            self.assertEqual(config['device'], 'cuda:0')
             self.assertEqual(config['initialization'], 'random')
             self.assertEqual(config['split_method'], 'actor_disjoint_20_4')
             self.assertEqual(len(config['train_actors']), 20)
@@ -101,7 +116,8 @@ class IndicatorDataTests(unittest.TestCase):
             for row in expanded:
                 expected = experiment.indicators_for_conditions([row['condition']], True)[0]
                 self.assertEqual([int(row['on_v']), int(row['on_a'])], expected)
-            for option in (['--head-dim', '0'], ['--lr', 'nan'], ['--mlp-dropout', '1']):
+            for option in (['--head-dim', '0'], ['--lr', 'nan'], ['--mlp-dropout', '1'],
+                           ['--gpu-ids', '0', '0'], ['--device', 'cpu', '--gpu-ids', '1']):
                 failed = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
                                          '--prepare-only', *option], cwd=root, capture_output=True, text=True)
                 self.assertEqual(failed.returncode, 2)
@@ -109,6 +125,25 @@ class IndicatorDataTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Requires PyTorch')
 class IndicatorModelTests(unittest.TestCase):
+    def test_actual_data_parallel_when_multiple_gpus_available(self):
+        import torch
+        if torch.cuda.device_count() < 2:
+            self.skipTest('Requires at least two CUDA GPUs')
+        raw = torch.nn.Linear(4, 6)
+        args = SimpleNamespace(device='cuda', gpu_ids=[0, 1], batch_size=8)
+        wrapped, info = experiment.configure_parallel_model(raw, args)
+        self.assertIsInstance(wrapped, torch.nn.DataParallel)
+        self.assertIs(wrapped.module, raw)
+        self.assertEqual(info['gpu_ids'], [0, 1])
+        self.assertEqual(args.device, 'cuda:0')
+        inputs = torch.randn(8, 4, device='cuda:0')
+        torch.testing.assert_close(wrapped(inputs), raw(inputs))
+        loss = torch.nn.functional.cross_entropy(wrapped(inputs), torch.arange(8, device='cuda:0') % 6)
+        loss.backward()
+        self.assertTrue(all(parameter.grad is not None for parameter in raw.parameters()))
+        restored = torch.nn.Linear(4, 6)
+        restored.load_state_dict(raw.state_dict(), strict=True)
+
     def test_concatenation_gradients_default_test_bits_and_checkpoint(self):
         import torch
         nn = torch.nn
@@ -225,6 +260,11 @@ class IndicatorTrainerTests(unittest.TestCase):
             self.assertEqual(summary['test_indicators'], experiment.TEST_INDICATORS)
             self.assertEqual(summary['initialization'], 'random')
             self.assertTrue((output/'final.pth').exists())
+            checkpoint = torch.load(output/'final.pth', map_location='cpu')
+            self.assertFalse(any(key.startswith('module.') for key in checkpoint['model']))
+            parallelism = json.loads((output/'parallelism.json').read_text())
+            self.assertEqual(parallelism['mode'], 'single_device')
+            self.assertEqual(parallelism['gpu_ids'], [])
             self.assertFalse((output/'best.pth').exists())
 
 
