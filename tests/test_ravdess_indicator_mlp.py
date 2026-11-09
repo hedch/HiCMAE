@@ -136,9 +136,11 @@ class IndicatorDataTests(unittest.TestCase):
                 for row in manifest:
                     self.assertEqual(int(Path(row['neutral_video']).stem.split('-')[-1]), int(row['actor']))
             self.assertIsNone(config['test_indicators'])
-            self.assertEqual(config['mlp_input_mode'], 'condition_gradient_gated')
+            self.assertEqual(config['mlp_input_mode'], 'gradient_gated')
             self.assertTrue(config['first_layer_gate_assignment']['fixed'])
-            self.assertEqual([config['av_gated_neurons'], config['visual_gated_neurons'], config['audio_gated_neurons']], [128, 64, 64])
+            self.assertNotIn('av_gated_neurons', config)
+            self.assertEqual([config['visual_gated_neurons'], config['audio_gated_neurons']], [128, 128])
+            self.assertEqual(config['training_gate_groups'], {'both': ['visual', 'audio'], 'video_noise': ['visual'], 'audio_neutral': ['audio']})
             self.assertEqual(config['neutral_frame_policy'], 'first')
             with (output/'train_expanded.csv').open() as f:
                 expanded = list(csv.DictReader(f))
@@ -154,22 +156,20 @@ class IndicatorDataTests(unittest.TestCase):
                                          '--prepare-only', *option], cwd=root, capture_output=True, text=True)
                 self.assertEqual(failed.returncode, 2)
             for i, (options, expected) in enumerate((
-                    (['--av-gated-neurons', '96', '--visual-gated-neurons', '80', '--audio-gated-neurons', '48'], [96, 80, 48]),
-                    (['--av-gated-neurons', '64'], [64, 64, 64]),
-                    (['--visual-gated-neurons', '160'], [128, 160, 64]),
-                    (['--audio-gated-neurons', '160'], [128, 64, 160]),
-                    (['--va-gated-neurons', '5', '--visual-gated-neurons', '7', '--audio-gated-neurons', '9'], [5, 7, 9]))):
+                    (['--visual-gated-neurons', '80', '--audio-gated-neurons', '48'], [80, 48]),
+                    (['--visual-gated-neurons', '160'], [160, 96]),
+                    (['--audio-gated-neurons', '160'], [96, 160]),
+                    (['--mlp-hidden-dims', '300', '128'], [150, 150]))):
                 custom = root / ('custom%d' % i)
                 result = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
                                          '--output-dir', str(custom), '--prepare-only', *options],
                                         cwd=root, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 custom_config = json.loads((custom/'config.json').read_text())
-                self.assertEqual([custom_config['av_gated_neurons'], custom_config['visual_gated_neurons'], custom_config['audio_gated_neurons']], expected)
+                self.assertEqual([custom_config['visual_gated_neurons'], custom_config['audio_gated_neurons']], expected)
                 self.assertEqual(custom_config['mlp_hidden_dims'], [sum(expected), 128])
-                self.assertEqual(custom_config['first_layer_gate_assignment']['av'], [0, expected[0]])
-                self.assertEqual(custom_config['first_layer_gate_assignment']['visual'], [expected[0], expected[0]+expected[1]])
-                self.assertEqual(custom_config['first_layer_gate_assignment']['audio'], [expected[0]+expected[1], sum(expected)])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['visual'], [0, expected[0]])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['audio'], [expected[0], sum(expected)])
                 self.assertEqual((custom/'train.csv').read_text(), (output/'train.csv').read_text())
                 self.assertEqual((custom/'test.csv').read_text(), (output/'test.csv').read_text())
 
