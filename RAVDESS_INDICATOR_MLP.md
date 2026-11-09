@@ -110,6 +110,53 @@ Preparation runs using only Python's standard library and this script:
 python run_ravdess_indicator_mlp.py --video-root /path/to/videos --audio-root /path/to/audio --output-dir runs/indicator_prepare --prepare-only
 ```
 
+## Select one or several GPUs (MLP runner only)
+
+The optional `--gpu-ids` parameter selects CUDA devices. One ID runs on that GPU;
+multiple IDs use PyTorch `DataParallel` in a single process, compatible with normal
+PyCharm script execution. The first listed GPU is the primary device for the
+model, optimizer and gathered logits.
+
+Append these parameters to your usual MLP command:
+
+```text
+--device cuda --gpu-ids 0 1 2 3 --batch-size 16
+```
+
+Other examples:
+
+```text
+--device cuda --gpu-ids 2 --batch-size 4
+--device cuda --gpu-ids 1 3 --batch-size 8
+```
+
+If `--gpu-ids` is omitted, the runner retains single-GPU behavior: `--device cuda`
+selects GPU 0, while `--device cuda:2` selects GPU 2. When both are provided,
+`--gpu-ids` determines the selection and its first ID determines the primary GPU.
+CPU execution uses `--device cpu` without GPU IDs. Duplicates, negative IDs and
+out-of-range IDs are rejected; runtime validates IDs against visible CUDA devices.
+GPU IDs are relative to devices visible to PyTorch, including any
+CUDA_VISIBLE_DEVICES filtering. Preparation validates syntax without requiring
+CUDA/PyTorch to be installed on the preparation machine.
+
+`--batch-size` is GLOBAL, not per GPU. Batch 16 across four GPUs normally gives
+four presentations per GPU. A global batch of four gives only one per GPU and
+parallel overhead can dominate; larger batches may improve utilization if memory
+permits. Increasing global batch size changes optimizer steps per epoch; the
+runner does not automatically change the learning rate. Media decoding remains
+on the existing single-process loader, so actual speedup depends on input loading
+and GPU communication as well as model compute. No fourfold speedup is promised.
+
+Training and epoch/final testing use the selected devices. Single-trial heatmap
+export deliberately uses the unwrapped model on the primary GPU, preserving
+native attention hooks and the saved test-indicator policy. Checkpoints and
+weight archives are saved without DataParallel's `module.` prefix and can be
+loaded on one GPU for explanation regeneration. `parallelism.json` records GPU
+IDs/names, primary device, mode and global batch size; final metrics also record
+this configuration. Other experiment runners are unchanged.
+
+Reference: [PyTorch DataParallel documentation](https://docs.pytorch.org/docs/stable/generated/torch.nn.DataParallel.html).
+
 ## Saved results and explanations
 
 - `config.json`: architecture, initialization, MLP settings and explicit training
