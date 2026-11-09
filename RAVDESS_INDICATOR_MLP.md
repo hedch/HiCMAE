@@ -37,7 +37,7 @@ and at least 2, but subsequent layers can have any positive widths.
 | --- | --- | --- | --- |
 | Original video + original audio | 1 | 1 | Not supplied |
 | Original video + white-noise audio | 1 | 0 | Not supplied |
-| Audio-only: white image in training, neutral image in testing | 0 | 1 | Not supplied |
+| Audio-only: Gaussian noise image in training, neutral image in testing | 0 | 1 | Not supplied |
 
 The gates act on gradients immediately after the first hidden activation, using:
 
@@ -74,12 +74,17 @@ Both neuron groups participate in every forward pass. The previous [1,1]/[1,0]
 test-input policy no longer applies to newly trained gated models. Direct eval-mode
 forward calls and heatmap regeneration require only video and audio tensors.
 
-During audio-only training, the visual input is a solid white RGB image
-(255,255,255), repeated across all 16 frames and processed with the same image
-normalization. During audio-only testing and heatmap regeneration, the visual
+During audio-only training, the visual input is one 160-by-160 2D Gaussian
+noise image, copied into all three RGB channels and repeated unchanged across
+all 16 frames. Pixels are sampled independently from N(0.5, 0.2²) in the [0,1]
+image-intensity scale, clipped to [0,1], converted to uint8 and processed with
+the same image normalization. This is a Gaussian random noise image, not a
+spatial Gaussian blob/mask. A local seeded generator gives a reproducible new
+image for each trial and epoch without adding temporal flicker. During audio-only testing and heatmap regeneration, the visual
 input remains frame 0 of the actor/statement/repetition-matched neutral sample,
 repeated across all 16 frames. The original emotional audio is retained.
-Config records `training_audio_only_visual=white` and
+Config records `training_audio_only_visual=gaussian_noise`,
+`visual_noise_mean=0.5`, `visual_noise_std=0.2`, and
 `testing_audio_only_visual=neutral`. Video-only uses fixed-RMS Gaussian
 white-noise audio. These placeholders
 are still passed through the encoders; availability flags refer to the intended
@@ -200,7 +205,9 @@ Reference: [PyTorch DataParallel documentation](https://docs.pytorch.org/docs/st
   are saved. There is no validation split.
 - Prediction CSVs: actual input availability (`available_v`, `available_a`) and
   training gates (`on_v`, `on_a`) are separate fields. Test on_v/on_a
-  are blank because no indicators are supplied. Each row includes emotion logits, probabilities and correctness.
+  are blank because no indicators are supplied. `visual_noise_seed` records the
+  actual Gaussian-image seed for audio-only training; it is blank otherwise.
+  Each row includes emotion logits, probabilities and correctness.
 - `final.pth`: all trained parameters and run settings.
 - `classifier_weights.npz`: feature-head/MLP tensors, not scalar modality weights.
 - Final three-condition prediction CSVs and metric JSONs.
