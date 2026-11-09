@@ -16,6 +16,16 @@ import run_ravdess_indicator_mlp as experiment
 class IndicatorDataTests(unittest.TestCase):
     def test_fixed_first_layer_partition_dimensions(self):
         self.assertEqual(experiment.first_layer_half_width(256), 128)
+        sizes = experiment.first_layer_gate_sizes
+        self.assertEqual(sizes(256), (128, 128))
+        self.assertEqual(sizes(256, 192, 64), (192, 64))
+        self.assertEqual(sizes(256, 32, 64), (32, 64))
+        self.assertEqual(sizes(256, visual=160), (160, 96))
+        self.assertEqual(sizes(256, audio=160), (96, 160))
+        self.assertEqual(sizes(256, 5, 8), (5, 8))
+        for visual, audio in ((0, 128), (-1, 128), (256, None), (None, 256)):
+            with self.assertRaises(ValueError):
+                sizes(256, visual, audio)
         for width in (0, 1, 3, 255):
             with self.assertRaises(ValueError):
                 experiment.first_layer_half_width(width)
@@ -117,6 +127,7 @@ class IndicatorDataTests(unittest.TestCase):
             self.assertIsNone(config['test_indicators'])
             self.assertEqual(config['mlp_input_mode'], 'gradient_gated')
             self.assertTrue(config['first_layer_gate_assignment']['fixed'])
+            self.assertEqual([config['visual_gated_neurons'], config['audio_gated_neurons']], [128, 128])
             self.assertEqual(config['neutral_frame_policy'], 'first')
             with (output/'train_expanded.csv').open() as f:
                 expanded = list(csv.DictReader(f))
@@ -126,10 +137,29 @@ class IndicatorDataTests(unittest.TestCase):
                 self.assertEqual([int(row['on_v']), int(row['on_a'])], expected)
             for option in (['--head-dim', '0'], ['--lr', 'nan'], ['--mlp-dropout', '1'],
                            ['--gpu-ids', '0', '0'], ['--device', 'cpu', '--gpu-ids', '1'],
-                           ['--mlp-hidden-dims', '255', '128']):
+                           ['--mlp-hidden-dims', '255', '128'], ['--visual-gated-neurons', '0'],
+                           ['--audio-gated-neurons', '-1'], ['--visual-gated-neurons', '256']):
                 failed = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
                                          '--prepare-only', *option], cwd=root, capture_output=True, text=True)
                 self.assertEqual(failed.returncode, 2)
+            for i, (options, expected) in enumerate((
+                    (['--visual-gated-neurons', '192', '--audio-gated-neurons', '64'], [192, 64]),
+                    (['--visual-gated-neurons', '32', '--audio-gated-neurons', '64'], [32, 64]),
+                    (['--visual-gated-neurons', '160'], [160, 96]),
+                    (['--audio-gated-neurons', '160'], [96, 160]),
+                    (['--visual-gated-neurons', '5', '--audio-gated-neurons', '8'], [5, 8]))):
+                custom = root / ('custom%d' % i)
+                result = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
+                                         '--output-dir', str(custom), '--prepare-only', *options],
+                                        cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                custom_config = json.loads((custom/'config.json').read_text())
+                self.assertEqual([custom_config['visual_gated_neurons'], custom_config['audio_gated_neurons']], expected)
+                self.assertEqual(custom_config['mlp_hidden_dims'], [sum(expected), 128])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['visual'], [0, expected[0]])
+                self.assertEqual(custom_config['first_layer_gate_assignment']['audio'], [expected[0], sum(expected)])
+                self.assertEqual((custom/'train.csv').read_text(), (output/'train.csv').read_text())
+                self.assertEqual((custom/'test.csv').read_text(), (output/'test.csv').read_text())
 
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Requires PyTorch')
@@ -147,14 +177,15 @@ class IndicatorModelTests(unittest.TestCase):
             return SimpleNamespace(encoder=Encoder(), encoder_audio=Encoder(),
                                    video_layer_weights=nn.Parameter(torch.ones(1)), audio_layer_weights=nn.Parameter(torch.ones(1)))
         args = SimpleNamespace(embed_dim=384, depth=1, drop_path=0., head_dim=8,
-                               mlp_hidden_dims=[12, 7, 9], mlp_dropout=0., mlp_input_mode='gradient_gated')
+                               mlp_hidden_dims=[12, 7, 9], mlp_dropout=0., mlp_input_mode='gradient_gated',
+                               visual_gated_neurons=8, audio_gated_neurons=4)
         with patch.dict('sys.modules', {'modeling_finetune_av': SimpleNamespace(AudioVisionTransformer=backbone)}):
             model = experiment.make_model(args)
             restored = experiment.make_model(args).eval()
         first = model.classifier[0]
         self.assertEqual(first.visual.in_features, 16)
-        self.assertEqual(first.visual.out_features, 6)
-        self.assertEqual(first.audio.out_features, 6)
+        self.assertEqual(first.visual.out_features, 8)
+        self.assertEqual(first.audio.out_features, 4)
         self.assertFalse(hasattr(model, 'test_indicators'))
         self.assertIsNone(model.indicators_for_test_condition('video_noise'))
         parameter_ids = [id(first.visual.weight), id(first.audio.weight)]
@@ -169,7 +200,7 @@ class IndicatorModelTests(unittest.TestCase):
         hidden = captures[-1]
         torch.testing.assert_close(logits, model(video, audio, indicators=torch.ones(3, 2)))
         logits.sum().backward()
-        mask = bits.repeat_interleave(6, dim=-1).bool()
+        mask = torch.cat((bits[:, :1].expand(-1, 8), bits[:, 1:2].expand(-1, 4)), dim=-1).bool()
         self.assertEqual(hidden.grad[~mask].abs().sum().item(), 0)
         self.assertGreater(hidden.grad[mask].abs().sum().item(), 0)
         handle.remove()
