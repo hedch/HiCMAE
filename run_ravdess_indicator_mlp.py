@@ -71,34 +71,41 @@ def discover(video_root, audio_root):
 
 
 def balanced_split(rows, seed):
-    """Mix actors; independently shuffle each emotion into 128 train / 64 test trials."""
+    """Hold out four complete actors; balance emotions within each partition."""
+    emotional = [row for row in rows if row['label'] in range(NUM_CLASSES)]
+    if len({row['video'] for row in emotional}) != len(emotional):
+        raise ValueError('Duplicate emotional trial')
+    actors = sorted({row['actor'] for row in emotional})
+    if len(actors) != 24:
+        raise ValueError('The 20:4 actor split requires 24 actors with emotional trials; found %d' % len(actors))
     rng = random.Random(seed)
-    result, report = {'train': [], 'test': []}, {}
-    original_counts = []
-    for label, emotion in enumerate(EMOTIONS):
-        bucket = sorted([row for row in rows if row['label'] == label], key=lambda r: r['video'])
-        if len({row['video'] for row in bucket}) != len(bucket):
-            raise ValueError('Duplicate emotional trial in ' + emotion)
-        original_counts.append(len(bucket))
-        if len(bucket) < 192:
-            raise ValueError('%s has %d trials; exactly 128 training + 64 testing requires at least 192.'
-                             % (emotion, len(bucket)))
-        rng.shuffle(bucket)
-        result['train'].extend(dict(row) for row in bucket[:128])
-        result['test'].extend(dict(row) for row in bucket[128:192])
-    train_ids = {row['video'] for row in result['train']}
-    test_ids = {row['video'] for row in result['test']}
-    if train_ids & test_ids:
-        raise ValueError('A trial occurs in both training and testing')
-    for name, n in [('train', 128), ('test', 64)]:
+    rng.shuffle(actors)
+    actor_groups = {'train': set(actors[4:]), 'test': set(actors[:4])}
+    result, report = {}, {}
+    for name, selected in actor_groups.items():
+        buckets = [sorted([row for row in emotional if row['actor'] in selected and row['label'] == label],
+                          key=lambda row: row['video']) for label in range(NUM_CLASSES)]
+        counts = [len(bucket) for bucket in buckets]
+        count = min(counts)
+        if count == 0:
+            raise ValueError('Missing emotion in %s actor partition: %s' % (name, counts))
+        result[name] = []
+        for bucket in buckets:
+            rng.shuffle(bucket)
+            result[name].extend(dict(row) for row in bucket[:count])
         rng.shuffle(result[name])
-        report[name] = dict(actors=sorted({row['actor'] for row in result[name]}),
-                            balanced_counts=[n] * NUM_CLASSES, total=n * NUM_CLASSES)
-    report['design'] = dict(method='mixed_actor_trial_split', seed=seed,
-                            original_counts=original_counts,
-                            unused_counts=[n-192 for n in original_counts],
-                            shared_actors=sorted({r['actor'] for r in result['train']} &
-                                                 {r['actor'] for r in result['test']}),
+        report[name] = dict(actors=sorted(selected), original_counts=counts,
+                            balanced_counts=[count] * NUM_CLASSES, total=count * NUM_CLASSES,
+                            unused_counts=[value-count for value in counts])
+    if actor_groups['train'] & actor_groups['test']:
+        raise RuntimeError('Actor overlap between training and testing')
+    if {row['video'] for row in result['train']} & {row['video'] for row in result['test']}:
+        raise RuntimeError('Trial overlap between training and testing')
+    original_counts = [sum(row['label'] == label for row in emotional) for label in range(NUM_CLASSES)]
+    report['design'] = dict(method='actor_disjoint_20_4', seed=seed,
+                            train_actor_count=20, test_actor_count=4, original_counts=original_counts,
+                            unused_counts=[report['train']['unused_counts'][i] + report['test']['unused_counts'][i]
+                                           for i in range(NUM_CLASSES)], shared_actors=[],
                             validation=False, checkpoint_selection='final_epoch')
     return result, report
 
@@ -470,12 +477,15 @@ def main():
     rows = discover(args.video_root, args.audio_root)
     splits, report = balanced_split(rows, args.seed)
     attach_test_controls(splits, rows, args.seed)
+    args.split_method = 'actor_disjoint_20_4'
+    args.train_actors = report['train']['actors']
+    args.test_actors = report['test']['actors']
     expanded = expand_training_rows(splits['train'])
     for row in expanded:
         row['on_v'], row['on_a'] = indicators_for_conditions([row['condition']], True)[0]
     report['train_expanded'] = dict(total=len(expanded), conditions=list(TEST_CONDITIONS),
                                    counts_per_condition={condition: len(splits['train']) for condition in TEST_CONDITIONS},
-                                   counts_per_emotion=[384]*NUM_CLASSES)
+                                   counts_per_emotion=[3*count for count in report['train']['balanced_counts']])
     output.mkdir(parents=True, exist_ok=True)
     (output / 'config.json').write_text(json.dumps(vars(args), indent=2))
     (output / 'split_report.json').write_text(json.dumps(dict(emotions=EMOTIONS, splits=report), indent=2))
