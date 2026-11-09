@@ -56,11 +56,24 @@ emotion-bearing modality. The shared original audiovisual condition remains real
 video/audio. Video and audio are cropped to a synchronized 2.56-second window.
 
 Six emotions and order: happy, sad, angry, fearful, surprised, disgusted. The
-mixed-actor split uses 128 training and 64 testing trials per emotion (768/384),
-without validation. Each base training trial occurs under all three conditions,
-creating 2304 shuffled presentations per epoch. Every condition therefore has 128
-training presentations per emotion. Training noise changes reproducibly by epoch;
-test noise is fixed. The held-out emotional trial identities remain disjoint.
+split is actor-disjoint: 20 actors for training and 4 held-out actors for testing,
+selected by shuffling the sorted 24 actor IDs using `--seed` (default 42). No actor
+appears in both partitions, including the neutral references matched to that actor.
+There is no validation set.
+
+On the complete dataset each actor has 8 trials per target emotion, giving 160
+training and 32 test trials per emotion: 960 base training trials and 192 test
+trials. Every training trial appears in all three shuffled conditions, creating
+2880 presentations per epoch (960 per condition; 480 per emotion across conditions).
+The test set is evaluated separately under all three conditions.
+
+Each partition is balanced separately across emotions by downsampling to its
+smallest emotion count if files are incomplete; actors are never moved between
+partitions to compensate. Missing an entire emotion in a partition raises an
+error. The 20:4 split requires all 24 actors to have emotional trials. Config and
+split report save the selected actor IDs, actual class counts and unused counts.
+Training noise changes reproducibly by epoch; test noise is fixed. Use a new run
+folder and retrain to adopt this split. Older run manifests remain unchanged.
 
 The loss is ordinary six-class emotion cross-entropy over all presentations.
 AdamW and cosine learning-rate decay train both encoders, pooling weights, feature
