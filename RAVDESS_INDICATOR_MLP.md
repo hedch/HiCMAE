@@ -34,14 +34,16 @@ is no DBM, interaction-product term, condition adversary or auxiliary emotion lo
 | Actual input condition | Training on_v/on_a | Testing on_v/on_a |
 | --- | --- | --- |
 | Original video + original audio | 1, 1 | 1, 1 |
-| Original video + white-noise audio | 1, 0 | 1, 1 |
+| Original video + white-noise audio | 1, 0 | 1, 0 |
 | Audio-only: white image in training, neutral image in testing | 0, 1 | 1, 1 |
 
-All three conditions are mixed and shuffled during training. At testing, both
-indicators are always 1, even when a real modality has been replaced by its control
-input. This is an explicit protocol rule; the test flags are not inferred from the
-condition. The model's eval-mode forward call also defaults to [1,1], so heatmaps
-and standalone evaluation use the same rule. Training requires explicit flags.
+All three conditions are mixed and shuffled during training. During testing,
+audiovisual and audio-neutral receive [1,1], while video-noise receives [1,0].
+This is an explicit saved per-condition policy: audio-neutral deliberately keeps
+on_v=1 even though its video is a neutral-image control. Training indicators remain
+unchanged. Testing and heatmap export explicitly pass the condition's saved bits.
+A direct eval-mode forward call without condition/indicator arguments defaults
+to [1,1]; training requires explicit flags.
 
 During audio-only training, the visual input is a solid white RGB image
 (255,255,255), repeated across all 16 frames and processed with the same image
@@ -120,7 +122,7 @@ python run_ravdess_indicator_mlp.py --video-root /path/to/videos --audio-root /p
   are saved. There is no validation split.
 - Prediction CSVs: actual input availability (`available_v`, `available_a`) and
   flags actually supplied (`on_v`, `on_a`) are separate fields. Test on_v/on_a
-  are always 1/1. Each row includes emotion logits, probabilities and correctness.
+  follow the per-condition table. Each row includes emotion logits, probabilities and correctness.
 - `final.pth`: all trained parameters and run settings.
 - `classifier_weights.npz`: feature-head/MLP tensors, not scalar modality weights.
 - Final three-condition prediction CSVs and metric JSONs.
@@ -134,8 +136,10 @@ python analyze_ravdess_results.py --run-dir runs/indicator_mlp01
 
 Explanation-only loading dispatches to this standalone runner's model and loader,
 without importing the interaction runner for this architecture. It explains the
-emotion CE through the MLP/video encoder with both indicators fixed to 1, saving
-that flag setting in explanation metadata. Per-condition images, colorful
+emotion CE through the MLP/video encoder with the saved condition-specific
+indicators, recording those flags in explanation metadata. Older run configs
+that saved a single [1,1] pair retain their original policy when regenerating
+heatmaps. Per-condition images, colorful
 heatmaps and global average emotion heatmaps keep the existing output format.
 
 Analysis retains emotion/condition accuracy curves and emotion bars. The model
