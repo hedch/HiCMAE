@@ -34,6 +34,8 @@ class IndicatorDataTests(unittest.TestCase):
         self.assertEqual(experiment.indicators_for_conditions(experiment.TEST_CONDITIONS, True),
                          [[1, 1], [1, 0], [0, 1]])
         self.assertEqual(experiment.indicators_for_conditions(experiment.TEST_CONDITIONS, False),
+                         [[1, 1], [1, 0], [1, 1]])
+        self.assertEqual(experiment.indicators_for_conditions(experiment.TEST_CONDITIONS, False, [1, 1]),
                          [[1, 1], [1, 1], [1, 1]])
         with self.assertRaises(ValueError):
             experiment.indicators_for_conditions(['unknown'], False)
@@ -91,7 +93,7 @@ class IndicatorDataTests(unittest.TestCase):
                 self.assertEqual({int(row['actor']) for row in manifest}, set(config[name+'_actors']))
                 for row in manifest:
                     self.assertEqual(int(Path(row['neutral_video']).stem.split('-')[-1]), int(row['actor']))
-            self.assertEqual(config['test_indicators'], [1, 1])
+            self.assertEqual(config['test_indicators'], experiment.TEST_INDICATORS)
             self.assertEqual(config['neutral_frame_policy'], 'first')
             with (output/'train_expanded.csv').open() as f:
                 expanded = list(csv.DictReader(f))
@@ -142,6 +144,10 @@ class IndicatorModelTests(unittest.TestCase):
         hook.remove()
         restored.load_state_dict(model.state_dict(), strict=True)
         torch.testing.assert_close(restored(video, audio), model(video, audio))
+        self.assertEqual(model.indicators_for_test_condition('video_noise'), [1, 1])
+        model.test_indicators = experiment.TEST_INDICATORS
+        self.assertEqual(model.indicators_for_test_condition('video_noise'), [1, 0])
+        self.assertEqual(model.indicators_for_test_condition('audio_neutral'), [1, 1])
         model.train()
         with self.assertRaises(ValueError):
             model(video, audio)
@@ -207,7 +213,8 @@ class IndicatorTrainerTests(unittest.TestCase):
             for condition in experiment.TEST_CONDITIONS:
                 with (output/('test_predictions_'+condition+'.csv')).open() as f:
                     rows = list(csv.DictReader(f))
-                self.assertEqual({(row['on_v'], row['on_a']) for row in rows}, {('1', '1')})
+                expected = tuple(str(bit) for bit in experiment.TEST_INDICATORS[condition])
+                self.assertEqual({(row['on_v'], row['on_a']) for row in rows}, {expected})
                 for row in rows:
                     self.assertEqual([int(row['available_v']), int(row['available_a'])],
                                      experiment.indicators_for_conditions([condition], True)[0])
@@ -215,7 +222,7 @@ class IndicatorTrainerTests(unittest.TestCase):
                         self.assertEqual(row['logit_'+emotion], row['mlp_logit_'+emotion])
             summary = json.loads((output/'test_metrics.json').read_text())
             self.assertEqual(summary['architecture'], 'indicator_mlp')
-            self.assertEqual(summary['test_indicators'], [1, 1])
+            self.assertEqual(summary['test_indicators'], experiment.TEST_INDICATORS)
             self.assertEqual(summary['initialization'], 'random')
             self.assertTrue((output/'final.pth').exists())
             self.assertFalse((output/'best.pth').exists())
