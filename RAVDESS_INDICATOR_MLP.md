@@ -1,4 +1,4 @@
-# Standalone indicator-concatenation MLP experiment
+# Standalone MLP with fixed first-layer gradient gates
 
 Run `run_ravdess_indicator_mlp.py`. It has its own data discovery, split generation,
 media loader, model construction, training loop, optimizer and output saving. It
@@ -16,34 +16,63 @@ pooled feature then has its own feature head:
 ```
 video head: LayerNorm(D) -> Linear(D, H) -> GELU -> hv
 audio head: LayerNorm(D) -> Linear(D, H) -> GELU -> ha
-MLP input: concatenate(hv, ha, on_v, on_a)
+MLP input: concatenate(hv, ha)
 emotion logits: MLP(MLP input)
 ```
 
 Here the heads are feature projections, not separate six-emotion classifiers.
-Defaults: D=512, H=256, MLP input width=514, hidden layers 256 and 128, six output
+Defaults: D=512, H=256, MLP input width=512, hidden layers 256 and 128, six output
 logits. Hidden MLP layers use GELU and dropout 0.1; the final linear layer has no
 softmax because training uses cross-entropy on logits.
 
-Indicators are appended as two scalar input features. They do not multiply, zero
-or gate the encoder features. Both encoders run for every input condition. There
-is no DBM, interaction-product term, condition adversary or auxiliary emotion loss.
+Indicators are NOT concatenated to the MLP input in new runs. The first hidden
+layer is permanently split into two equal neuron groups. The first half's incoming
+weights/biases are controlled by on_v and the second half's by on_a; the assignments
+never shuffle across epochs, batches or GPUs. The first hidden width must be even
+and at least 2, but subsequent layers can have any positive widths.
 
-## Training and testing indicators
+## Training-only backward gating
 
-| Actual input condition | Training on_v/on_a | Testing on_v/on_a |
-| --- | --- | --- |
-| Original video + original audio | 1, 1 | 1, 1 |
-| Original video + white-noise audio | 1, 0 | 1, 0 |
-| Audio-only: white image in training, neutral image in testing | 0, 1 | 1, 1 |
+| Actual input condition | First-half gradient gate | Second-half gradient gate | Testing indicators |
+| --- | --- | --- | --- |
+| Original video + original audio | 1 | 1 | Not supplied |
+| Original video + white-noise audio | 1 | 0 | Not supplied |
+| Audio-only: white image in training, neutral image in testing | 0 | 1 | Not supplied |
 
-All three conditions are mixed and shuffled during training. During testing,
-audiovisual and audio-neutral receive [1,1], while video-noise receives [1,0].
-This is an explicit saved per-condition policy: audio-neutral deliberately keeps
-on_v=1 even though its video is a neutral-image control. Training indicators remain
-unchanged. Testing and heatmap export explicitly pass the condition's saved bits.
-A direct eval-mode forward call without condition/indicator arguments defaults
-to [1,1]; training requires explicit flags.
+The gates act on gradients immediately after the first hidden activation, using:
+
+```
+g = concatenate(repeat(on_v, first_width/2), repeat(on_a, first_width/2))
+h_gated = detach(h) + g * (h - detach(h))
+```
+
+Forward values are exactly h. Backward gradients into the first hidden layer are
+multiplied by g for EACH example. This is backward-only gating, not neuron
+activation dropout or forward masking. Subsequent MLP layers train normally using
+all examples. Both encoders run for every condition. There is no DBM, adversarial
+classifier or auxiliary emotion loss.
+
+Both neuron groups receive the full concatenated visual/audio features; the gate
+names label groups, not exclusive connections to one modality. Either active
+group can therefore send gradients to both encoders. Only first-layer incoming
+weights/biases are subject to the strict inactive-group freezing rule. Frozen
+weights do not mean constant activations when the upstream encoders change.
+
+The two first-layer groups have separate parameter tensors. After backward, if
+NO example in the entire global minibatch enables a group, its parameter gradients
+are set to None before AdamW.step(). AdamW then skips that group entirely, including
+its weight decay, momentum and optimizer-state step. With mixed examples, an
+active group updates once per optimizer step, using only its eligible examples'
+task gradients. Global eligibility is checked after DataParallel reduces gradients,
+so a GPU-local inactive group can still update from eligible examples on another
+selected GPU.
+
+## Indicator-free testing and explanations
+
+All three conditions run without indicator inputs or gradient gates during testing.
+Both neuron groups participate in every forward pass. The previous [1,1]/[1,0]
+test-input policy no longer applies to newly trained gated models. Direct eval-mode
+forward calls and heatmap regeneration require only video and audio tensors.
 
 During audio-only training, the visual input is a solid white RGB image
 (255,255,255), repeated across all 16 frames and processed with the same image
@@ -77,7 +106,8 @@ split report save the selected actor IDs, actual class counts and unused counts.
 Training noise changes reproducibly by epoch; test noise is fixed. Use a new run
 folder and retrain to adopt this split. Older run manifests remain unchanged.
 
-The loss is ordinary six-class emotion cross-entropy over all presentations.
+The loss is ordinary six-class emotion cross-entropy over all presentations;
+training gates control which samples contribute first-layer gradients.
 AdamW and cosine learning-rate decay train both encoders, pooling weights, feature
 heads and MLP. The final epoch is saved; test accuracy does not select a checkpoint.
 
@@ -149,7 +179,7 @@ and GPU communication as well as model compute. No fourfold speedup is promised.
 
 Training and epoch/final testing use the selected devices. Single-trial heatmap
 export deliberately uses the unwrapped model on the primary GPU, preserving
-native attention hooks and the saved test-indicator policy. Checkpoints and
+native attention hooks and indicator-free evaluation for new gated models. Checkpoints and
 weight archives are saved without DataParallel's `module.` prefix and can be
 loaded on one GPU for explanation regeneration. `parallelism.json` records GPU
 IDs/names, primary device, mode and global batch size; final metrics also record
@@ -159,8 +189,9 @@ Reference: [PyTorch DataParallel documentation](https://docs.pytorch.org/docs/st
 
 ## Saved results and explanations
 
-- `config.json`: architecture, initialization, MLP settings and explicit training
-  and testing indicator policies.
+- `config.json`: architecture, initialization, MLP settings,
+  `mlp_input_mode=gradient_gated`, the fixed half assignments and training gates.
+  `test_indicators` is null.
 - `train.csv`, `test.csv`, `split_report.json`: underlying trial manifests/counts.
 - `train_expanded.csv`: condition-specific training rows with on_v/on_a.
 - `epoch_metrics.csv`, `history.jsonl`, `epoch_predictions/`: online aggregate and
@@ -168,8 +199,8 @@ Reference: [PyTorch DataParallel documentation](https://docs.pytorch.org/docs/st
   disabled. Accuracy, loss, correct/total, UAR, macro F1 and confusion matrices
   are saved. There is no validation split.
 - Prediction CSVs: actual input availability (`available_v`, `available_a`) and
-  flags actually supplied (`on_v`, `on_a`) are separate fields. Test on_v/on_a
-  follow the per-condition table. Each row includes emotion logits, probabilities and correctness.
+  training gates (`on_v`, `on_a`) are separate fields. Test on_v/on_a
+  are blank because no indicators are supplied. Each row includes emotion logits, probabilities and correctness.
 - `final.pth`: all trained parameters and run settings.
 - `classifier_weights.npz`: feature-head/MLP tensors, not scalar modality weights.
 - Final three-condition prediction CSVs and metric JSONs.
@@ -182,12 +213,16 @@ python analyze_ravdess_results.py --run-dir runs/indicator_mlp01
 ```
 
 Explanation-only loading dispatches to this standalone runner's model and loader,
-without importing the interaction runner for this architecture. It explains the
-emotion CE through the MLP/video encoder with the saved condition-specific
-indicators, recording those flags in explanation metadata. Older run configs
-that saved a single [1,1] pair retain their original policy when regenerating
-heatmaps. Per-condition images, colorful
-heatmaps and global average emotion heatmaps keep the existing output format.
+without importing the interaction runner for this architecture. It explains emotion
+CE through the full MLP/video encoder in eval mode, without indicators or backward
+gates. Per-condition images, colorful heatmaps and global average emotion heatmaps
+keep the existing format.
+
+Older concatenated-indicator checkpoints still reconstruct their original model
+and saved test-indicator policy. New gated checkpoints have a different first-layer
+shape/parameter layout and must be retrained in a NEW output folder. They cannot
+reuse an old MLP head directly. The optional --checkpoint encoder initializer can
+still load matching encoder/pooling weights while initializing the new head.
 
 Analysis retains emotion/condition accuracy curves and emotion bars. The model
 has one joint nonlinear MLP output; it does not have independently additive visual
@@ -201,6 +236,6 @@ no meaningful classifier accuracy.
 Tests cover independent import/preparation with no other runner files, balanced
 and disjoint data splits, exact indicator policies, configuration/manifest exports,
 and numerical single-output analysis. Optional PyTorch tests cover concatenation,
-feature gradients, checkpoint loading, eval defaults and actual training/testing
-flags saved by the training loop. Full GPU/media training requires the user's
+backward-only sample masks, fixed group assignments, exact inactive-half AdamW
+parameter/state freezing, checkpoint loading and indicator-free testing. Full GPU/media training requires the user's
 PyTorch environment and dataset.
