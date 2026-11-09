@@ -16,13 +16,16 @@ NUM_CLASSES = len(EMOTIONS)
 TEST_CONDITIONS = ('both', 'video_noise', 'audio_neutral')
 LOGIT_TERMS = ('mlp',)
 ARCHITECTURE = 'indicator_mlp'
+TEST_INDICATORS = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [1, 1]}
 
 
-def indicators_for_conditions(conditions, training):
+def indicators_for_conditions(conditions, training, test_policy=None):
     available = {'both': (1, 1), 'video_noise': (1, 0), 'audio_neutral': (0, 1)}
     if any(condition not in available for condition in conditions):
         raise ValueError('Unknown input condition')
-    return [list(available[condition] if training else (1, 1)) for condition in conditions]
+    policy = TEST_INDICATORS if test_policy is None else test_policy
+    return [list(available[condition] if training else policy[condition] if isinstance(policy, dict) else policy)
+            for condition in conditions]
 
 
 def discover(video_root, audio_root):
@@ -230,10 +233,11 @@ def make_model(args):
     class IndicatorMLP(nn.Module):
         architecture = ARCHITECTURE
         logit_terms = LOGIT_TERMS
-        test_indicators = (1, 1)
 
         def __init__(self):
             super().__init__()
+            # Legacy checkpoints saved one shared [1,1] pair; preserve that policy.
+            self.test_indicators = getattr(args, 'test_indicators', [1, 1])
             backbone = AudioVisionTransformer(
                 img_size=160, patch_size=16, embed_dim=args.embed_dim,
                 num_heads=args.embed_dim // 64, depth=args.depth,
@@ -254,6 +258,9 @@ def make_model(args):
                 width = hidden
             layers.append(nn.Linear(width, NUM_CLASSES))
             self.classifier = nn.Sequential(*layers)
+
+        def indicators_for_test_condition(self, condition):
+            return indicators_for_conditions([condition], False, self.test_indicators)[0]
 
         def forward(self, video, audio, indicators=None, return_terms=False):
             v = self.encoder(video).mean(1)
@@ -344,7 +351,7 @@ def train(splits, args, output):
                 index_list = indices.tolist()
                 rows = [loader.dataset.rows[index] for index in index_list]
                 conditions = [row.get('condition', loader.dataset.condition) for row in rows]
-                bits = indicators_for_conditions(conditions, training)
+                bits = indicators_for_conditions(conditions, training, getattr(args, 'test_indicators', TEST_INDICATORS))
                 indicators = torch.tensor(bits, device=device, dtype=torch.float32)
                 logits, terms = model(video.to(device), audio.to(device), indicators=indicators, return_terms=True)
                 torch.testing.assert_close(logits, sum(terms))
@@ -423,7 +430,7 @@ def train(splits, args, output):
     summary = dict(emotions=EMOTIONS, architecture=ARCHITECTURE, logit_terms=list(LOGIT_TERMS),
                    initialization='pretrained_encoders' if args.checkpoint else 'random',
                    checkpoint_epoch=args.epochs, checkpoint_file='final.pth', checkpoint_selection='final_epoch',
-                   test_indicators=[1, 1], conditions=final)
+                   test_indicators=getattr(args, 'test_indicators', TEST_INDICATORS), conditions=final)
     (output / 'test_metrics.json').write_text(json.dumps(summary, indent=2))
     if not args.skip_explanations:
         from video_loss_explanations import export_test_explanations
@@ -469,7 +476,7 @@ def main():
     args.testing_audio_only_visual = 'neutral'
     args.training_conditions = list(TEST_CONDITIONS)
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
-    args.test_indicators = [1, 1]
+    args.test_indicators = {condition: list(bits) for condition, bits in TEST_INDICATORS.items()}
     args.initialization = 'pretrained_encoders' if args.checkpoint else 'random'
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
