@@ -613,12 +613,10 @@ def main():
     parser.add_argument('--depth', type=int, default=10)
     parser.add_argument('--head-dim', type=int, default=256)
     parser.add_argument('--mlp-hidden-dims', nargs='+', type=int, default=[256, 128])
-    parser.add_argument('--av-gated-neurons', '--va-gated-neurons', dest='av_gated_neurons', type=int, default=128,
-                        help='First-layer AV-only gradient group size (default 128)')
-    parser.add_argument('--visual-gated-neurons', type=int, default=64,
-                        help='First-layer video-only gradient group size (default 64)')
-    parser.add_argument('--audio-gated-neurons', type=int, default=64,
-                        help='First-layer audio-only gradient group size (default 64)')
+    parser.add_argument('--visual-gated-neurons', type=int, default=None,
+                        help='Visual gradient group size; default half the first hidden width')
+    parser.add_argument('--audio-gated-neurons', type=int, default=None,
+                        help='Audio gradient group size; default half the first hidden width')
     parser.add_argument('--mlp-dropout', type=float, default=.1)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=4)
@@ -640,8 +638,9 @@ def main():
     if min(args.epochs, args.batch_size, args.depth, args.head_dim, *args.mlp_hidden_dims) < 1:
         parser.error('Epochs, batch size, depth and MLP dimensions must be positive')
     try:
-        gate_sizes = condition_gate_sizes(args.av_gated_neurons, args.visual_gated_neurons, args.audio_gated_neurons)
-        args.mlp_hidden_dims[0] = sum(gate_sizes.values())
+        args.visual_gated_neurons, args.audio_gated_neurons = first_layer_gate_sizes(
+            args.mlp_hidden_dims[0], args.visual_gated_neurons, args.audio_gated_neurons)
+        args.mlp_hidden_dims[0] = args.visual_gated_neurons + args.audio_gated_neurons
     except ValueError as error:
         parser.error(str(error))
     if not math.isfinite(args.lr) or args.lr <= 0 or not math.isfinite(args.weight_decay) or args.weight_decay < 0:
@@ -657,13 +656,12 @@ def main():
     args.testing_audio_only_visual = 'neutral'
     args.training_conditions = list(TEST_CONDITIONS)
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
-    args.mlp_input_mode = 'condition_gradient_gated'
+    args.mlp_input_mode = 'gradient_gated'
     args.test_indicators = None
-    args.first_layer_gate_assignment = dict(av=[0, args.av_gated_neurons],
-        visual=[args.av_gated_neurons, args.av_gated_neurons + args.visual_gated_neurons],
-        audio=[args.av_gated_neurons + args.visual_gated_neurons, args.mlp_hidden_dims[0]],
+    args.first_layer_gate_assignment = dict(visual=[0, args.visual_gated_neurons],
+        audio=[args.visual_gated_neurons, args.mlp_hidden_dims[0]],
         ranges='start_inclusive_end_exclusive', fixed=True)
-    args.training_gate_groups = {'both': 'av', 'video_noise': 'visual', 'audio_neutral': 'audio'}
+    args.training_gate_groups = {'both': ['visual', 'audio'], 'video_noise': ['visual'], 'audio_neutral': ['audio']}
     args.initialization = 'pretrained_encoders' if args.checkpoint else 'random'
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
