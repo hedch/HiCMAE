@@ -26,40 +26,34 @@ logits. Hidden MLP layers use GELU and dropout 0.1; the final linear layer has n
 softmax because training uses cross-entropy on logits.
 
 Indicators are NOT concatenated to the MLP input in new runs. The first hidden
-layer has THREE permanently assigned, non-overlapping groups, ordered AV, video-only, audio-only. Group sizes are independent positive integer parameters. The
-assignments never shuffle across epochs, batches or GPUs. All subsequent layers
+layer has TWO permanently assigned, non-overlapping groups, ordered visual then
+audio. Assignments never shuffle across epochs, batches or GPUs. Subsequent layers
 remain shared.
 
 ## Training-only backward gating
 
-| Actual input condition | AV-group gradient gate | Video-group gate | Audio-group gate | Testing indicators |
-| --- | --- | --- | --- | --- |
-| Original video + original audio | 1 | 0 | 0 | Not supplied |
-| Original video + white-noise audio | 0 | 1 | 0 | Not supplied |
-| Audio-only: Gaussian noise image in training, neutral image in testing | 0 | 0 | 1 | Not supplied |
+| Actual training condition | Visual-group gradient gate | Audio-group gradient gate |
+| --- | --- | --- |
+| Original video + original audio | 1 | 1 |
+| Original video + white-noise audio | 1 | 0 |
+| Original audio + Gaussian noise image | 0 | 1 |
 
-The input availability bits still identify the training condition: [1,1] for AV,
-[1,0] for video-only, [0,1] for audio-only. They are converted to a three-way group
-mask. [0,0] is not a valid training condition.
+The training availability bits [on_v, on_a] directly gate incoming gradients:
 
 ```
-g_av = on_v * on_a
-g_v  = on_v * (1 - on_a)
-g_a  = (1 - on_v) * on_a
-g = concatenate(repeat(g_av, N_av), repeat(g_v, N_visual), repeat(g_a, N_audio))
+g = concatenate(repeat(on_v, N_visual), repeat(on_a, N_audio))
 h_gated = detach(h) + g * (h - detach(h))
 ```
 
-Forward values are exactly h. Only incoming gradients are gated after the first
-hidden activation. Each example supplies task gradients to exactly one fixed
-first-layer group. All other groups still participate in its forward pass. Later
-MLP layers train normally using all conditions.
+Forward values are exactly h. Audiovisual examples supply task gradients to BOTH
+fixed first-layer groups. Video-only examples train the visual group; audio-only
+examples train the audio group. Both groups still participate in every forward
+pass. Later MLP layers train normally using all conditions.
 
-All three groups consume the full concatenated visual/audio feature input, so the
-names indicate permitted training CONDITIONS, not exclusive encoder connections.
-An active group can send gradients to both encoders. The strict freezing rule
-applies only to first-layer incoming weights/biases, not the entire encoders.
-There is no DBM, adversarial classifier or auxiliary emotion loss.
+Both groups consume the full concatenated visual/audio feature input. Their names
+identify gradient eligibility, not exclusive encoder connections. An active group
+can send gradients to both encoders. Strict freezing applies to first-layer
+incoming weights/biases. There is no DBM or auxiliary classifier/loss.
 
 Each group has separate parameter tensors. After backward, any group with NO
 eligible example in the entire global minibatch has its gradients set to None
@@ -71,7 +65,7 @@ DataParallel reduces gradients, so it includes examples on all selected GPUs.
 ## Indicator-free testing and explanations
 
 All three conditions run without indicator inputs or gradient gates during testing.
-All three neuron groups participate in every forward pass. The previous [1,1]/[1,0]
+Both neuron groups participate in every forward pass. The previous [1,1]/[1,0]
 test-input policy no longer applies to newly trained gated models. Direct eval-mode
 forward calls and heatmap regeneration require only video and audio tensors.
 
@@ -117,30 +111,25 @@ training gates control which samples contribute first-layer gradients.
 AdamW and cosine learning-rate decay train both encoders, pooling weights, feature
 heads and MLP. The final epoch is saved; test accuracy does not select a checkpoint.
 
-## Choose active-neuron counts for all three conditions
+## Choose visual and audio group sizes
 
 ```text
---av-gated-neurons 128 --visual-gated-neurons 64 --audio-gated-neurons 64
+--visual-gated-neurons 128 --audio-gated-neurons 128
 ```
 
-`--va-gated-neurons` is an alias for `--av-gated-neurons`. The independent defaults
-are AV=128, video-only=64, audio-only=64 (total first-layer width 256). Every count
-must be positive. Counts need not match, and their sum may be odd.
+With neither flag, each group gets half of the first `--mlp-hidden-dims` width
+(default 256 gives 128 visual + 128 audio). With one count supplied, the other is
+inferred from that width. With both supplied, their sum overrides the first width.
+For example, `--visual-gated-neurons 160 --audio-gated-neurons 64` gives width 224.
+Each group must have at least one neuron. Subsequent hidden widths are unchanged.
+The `--av-gated-neurons` / `--va-gated-neurons` flags are removed: VA uses both groups.
 
-The sum ALWAYS determines the first hidden width and overrides the first entry of
-`--mlp-hidden-dims`; subsequent entries remain unchanged. For example, AV=96,
-video=80 and audio=48 with `--mlp-hidden-dims 256 128` produces widths 224 and 128.
-Changing one count leaves the other two at their supplied values or defaults;
-there is no inferred remainder in the new three-group design.
-
-Indices are permanently assigned in AV/video/audio order. Config saves each count,
-the resolved hidden widths, fixed index ranges (start-inclusive/end-exclusive),
-and the mapping of training conditions to groups. Prediction rows additionally
-record `gradient_gate_group` during training, blank at testing.
-
-New three-group checkpoints require retraining in a new folder. Previous two-group
-and concatenated-indicator checkpoints still reconstruct their original models
-and policies for explanation regeneration; they are not silently converted.
+Config saves resolved counts, fixed visual/audio index ranges and training-group
+eligibility. Start a new output folder and retrain to change group structure.
+Previously saved three-group (`condition_gradient_gated`), two-group
+(`gradient_gated`) and concatenated-indicator checkpoints still reconstruct their
+original architectures for explanation regeneration. Three-group support in the
+loader is retained only for those saved runs; new CLI training uses two groups.
 
 ## Initialization and running
 
@@ -221,7 +210,7 @@ Reference: [PyTorch DataParallel documentation](https://docs.pytorch.org/docs/st
 ## Saved results and explanations
 
 - `config.json`: architecture, initialization, MLP settings,
-  `mlp_input_mode=condition_gradient_gated`, the resolved gated-neuron counts, fixed index ranges and training gates.
+  `mlp_input_mode=gradient_gated`, the resolved gated-neuron counts, fixed index ranges and training gates.
   `test_indicators` is null.
 - `train.csv`, `test.csv`, `split_report.json`: underlying trial manifests/counts.
 - `train_expanded.csv`: condition-specific training rows with on_v/on_a.
