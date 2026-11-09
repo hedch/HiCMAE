@@ -192,6 +192,14 @@ def white_noise(num_samples, seed, rms):
     return wave * (rms / wave.square().mean().sqrt().clamp_min(1e-12))
 
 
+def gaussian_noise_image(seed, mean=.5, std=.2, size=160):
+    """One 2D Gaussian noise realization, replicated across RGB channels."""
+    import numpy as np
+    noise = np.random.default_rng(seed).normal(mean, std, size=(size, size))
+    gray = np.rint(np.clip(noise, 0., 1.) * 255).astype(np.uint8)
+    return np.repeat(gray[..., None], 3, axis=-1)
+
+
 def make_loaders(splits, args):
     import numpy as np
     import torch
@@ -225,6 +233,12 @@ def make_loaders(splits, args):
             times = start + np.arange(16) * span / 16
             indices = np.clip((times * fps).astype(int), 0, len(vr) - 1)
             if (condition == 'audio_neutral' and self.training
+                    and getattr(args, 'training_audio_only_visual', 'neutral') == 'gaussian_noise'):
+                visual_seed = row['noise_seed'] + self.epoch * 1000000 + 2000000000
+                image = gaussian_noise_image(visual_seed, getattr(args, 'visual_noise_mean', .5),
+                                             getattr(args, 'visual_noise_std', .2))
+                pixels = np.repeat(image[None], 16, axis=0)
+            elif (condition == 'audio_neutral' and self.training
                     and getattr(args, 'training_audio_only_visual', 'neutral') == 'white'):
                 # Pure RGB white before the same normal preprocessing as all video.
                 pixels = np.full((16, 160, 160, 3), 255, dtype=np.uint8)
@@ -462,8 +476,11 @@ def train(splits, args, output):
                     if training and conditions[i] == 'video_noise' and noise_seed != '':
                         noise_seed += getattr(loader.dataset, 'epoch', 0) * 1000000
                     target = int(label[i].item())
+                    visual_seed = (row['noise_seed'] + getattr(loader.dataset, 'epoch', 0) * 1000000 + 2000000000
+                                   if training and conditions[i] == 'audio_neutral'
+                                   and getattr(args, 'training_audio_only_visual', '') == 'gaussian_noise' else '')
                     record = dict(video=row['video'], actor=row['actor'], condition=conditions[i],
-                                  neutral_video=row.get('neutral_video', ''), noise_seed=noise_seed,
+                                  neutral_video=row.get('neutral_video', ''), noise_seed=noise_seed, visual_noise_seed=visual_seed,
                                   available_v=available[0], available_a=available[1],
                                   on_v=bits[i][0] if bits is not None else '', on_a=bits[i][1] if bits is not None else '',
                                   label=target, prediction=predictions[i], correct=int(target == predictions[i]), loss=loss_values[i])
@@ -575,7 +592,8 @@ def main():
         parser.error('Noise RMS must be in (0,1] and explanation limit nonnegative')
     args.architecture, args.logit_terms = ARCHITECTURE, list(LOGIT_TERMS)
     args.neutral_frame_policy = 'first'
-    args.training_audio_only_visual = 'white'
+    args.training_audio_only_visual = 'gaussian_noise'
+    args.visual_noise_mean, args.visual_noise_std = .5, .2
     args.testing_audio_only_visual = 'neutral'
     args.training_conditions = list(TEST_CONDITIONS)
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
