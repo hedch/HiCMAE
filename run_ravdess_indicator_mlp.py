@@ -19,6 +19,45 @@ ARCHITECTURE = 'indicator_mlp'
 TEST_INDICATORS = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [1, 1]}
 
 
+def resolve_gpu_selection(device, gpu_ids=None, available_count=None):
+    """Select visible CUDA IDs without importing torch (also used in preparation)."""
+    requested = list(gpu_ids) if gpu_ids else None
+    if not device.startswith('cuda'):
+        if requested:
+            raise ValueError('--gpu-ids requires a CUDA --device')
+        return device, []
+    if device != 'cuda':
+        parts = device.split(':')
+        if len(parts) != 2 or parts[0] != 'cuda' or not parts[1].isdigit():
+            raise ValueError('Use --device cuda or cuda:N')
+    selected = requested if requested is not None else [0 if device == 'cuda' else int(device.split(':')[1])]
+    if any(type(index) is not int or index < 0 for index in selected) or len(set(selected)) != len(selected):
+        raise ValueError('--gpu-ids must contain unique nonnegative GPU indices')
+    if available_count is not None and any(index >= available_count for index in selected):
+        raise ValueError('Requested GPUs %s, but PyTorch sees %d CUDA devices' % (selected, available_count))
+    return 'cuda:%d' % selected[0], selected
+
+
+def configure_parallel_model(raw_model, args):
+    """Single-process DataParallel; raw_model stays suitable for checkpoint/heatmap use."""
+    import torch
+    count = torch.cuda.device_count() if args.device.startswith('cuda') else 0
+    primary, selected = resolve_gpu_selection(args.device, getattr(args, 'gpu_ids', None), count)
+    args.device, args.gpu_ids = primary, selected
+    raw_model.to(torch.device(primary))
+    model = (torch.nn.DataParallel(raw_model, device_ids=selected, output_device=selected[0])
+             if len(selected) > 1 else raw_model)
+    info = dict(mode='data_parallel' if len(selected) > 1 else 'single_device', primary_device=primary,
+                gpu_ids=selected, gpu_names=[torch.cuda.get_device_name(index) for index in selected],
+                global_batch_size=args.batch_size,
+                maximum_samples_per_gpu=math.ceil(args.batch_size / max(1, len(selected))))
+    print('Device configuration:', json.dumps(info), flush=True)
+    if len(selected) > 1 and args.batch_size <= len(selected):
+        print('Small global batch: consider --batch-size 16 for four GPUs if memory permits; '
+              'parallel overhead can dominate small batches.', flush=True)
+    return model, info
+
+
 def indicators_for_conditions(conditions, training, test_policy=None):
     available = {'both': (1, 1), 'video_noise': (1, 0), 'audio_neutral': (0, 1)}
     if any(condition not in available for condition in conditions):
@@ -330,13 +369,14 @@ def train(splits, args, output):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    device = torch.device(args.device)
-    model = make_model(args)
+    raw_model = make_model(args)
     if args.checkpoint:
-        load_pretrained(model, args.checkpoint)
+        load_pretrained(raw_model, args.checkpoint)
     else:
         print('Training both encoders, feature heads and MLP from random initialization.')
-    model.to(device)
+    model, parallelism = configure_parallel_model(raw_model, args)
+    device = torch.device(args.device)
+    (output / 'parallelism.json').write_text(json.dumps(parallelism, indent=2))
     loaders = make_loaders(splits, args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -417,9 +457,10 @@ def train(splits, args, output):
             f.write(json.dumps(record)+'\n')
         scheduler.step()
 
-    torch.save(dict(model=model.state_dict(), args=vars(args), epoch=args.epochs, emotions=EMOTIONS,
+    # Save the underlying model, never DataParallel's module.-prefixed state dict.
+    torch.save(dict(model=raw_model.state_dict(), args=vars(args), epoch=args.epochs, emotions=EMOTIONS,
                     checkpoint_selection='final_epoch'), output / 'final.pth')
-    matrices = {key.replace('.', '_'): value.detach().cpu().numpy() for key, value in model.state_dict().items()
+    matrices = {key.replace('.', '_'): value.detach().cpu().numpy() for key, value in raw_model.state_dict().items()
                 if key.startswith(('classifier.', 'video_head.', 'audio_head.'))}
     np.savez_compressed(output / 'classifier_weights.npz', emotions=np.asarray(EMOTIONS), logit_terms=np.asarray(LOGIT_TERMS), **matrices)
     final = {}
@@ -430,11 +471,13 @@ def train(splits, args, output):
     summary = dict(emotions=EMOTIONS, architecture=ARCHITECTURE, logit_terms=list(LOGIT_TERMS),
                    initialization='pretrained_encoders' if args.checkpoint else 'random',
                    checkpoint_epoch=args.epochs, checkpoint_file='final.pth', checkpoint_selection='final_epoch',
+                   parallelism=parallelism,
                    test_indicators=getattr(args, 'test_indicators', TEST_INDICATORS), conditions=final)
     (output / 'test_metrics.json').write_text(json.dumps(summary, indent=2))
     if not args.skip_explanations:
         from video_loss_explanations import export_test_explanations
-        export_test_explanations(model, loaders, splits['test'], TEST_CONDITIONS, device, output, args.explain_limit)
+        # Native attention hooks and one-trial explanations run on the primary GPU.
+        export_test_explanations(raw_model, loaders, splits['test'], TEST_CONDITIONS, device, output, args.explain_limit)
     print('Final-epoch test results:', json.dumps(final), flush=True)
 
 
@@ -457,11 +500,17 @@ def main():
     parser.add_argument('--weight-decay', type=float, default=.05)
     parser.add_argument('--drop-path', type=float, default=.1)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--gpu-ids', nargs='+', type=int,
+                        help='CUDA GPU indices, e.g. 2 or 0 1 2 3; first is primary. Omit for one GPU.')
     parser.add_argument('--noise-rms', type=float, default=.05)
     parser.add_argument('--skip-epoch-tests', action='store_true')
     parser.add_argument('--skip-explanations', action='store_true')
     parser.add_argument('--explain-limit', type=int, default=0)
     args = parser.parse_args()
+    try:
+        args.device, args.gpu_ids = resolve_gpu_selection(args.device, args.gpu_ids)
+    except ValueError as error:
+        parser.error(str(error))
     if min(args.epochs, args.batch_size, args.depth, args.head_dim, *args.mlp_hidden_dims) < 1:
         parser.error('Epochs, batch size, depth and MLP dimensions must be positive')
     if not math.isfinite(args.lr) or args.lr <= 0 or not math.isfinite(args.weight_decay) or args.weight_decay < 0:
