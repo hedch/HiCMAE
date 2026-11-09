@@ -14,6 +14,12 @@ import run_ravdess_indicator_mlp as experiment
 
 
 class IndicatorDataTests(unittest.TestCase):
+    def test_fixed_first_layer_partition_dimensions(self):
+        self.assertEqual(experiment.first_layer_half_width(256), 128)
+        for width in (0, 1, 3, 255):
+            with self.assertRaises(ValueError):
+                experiment.first_layer_half_width(width)
+
     def test_gpu_selection_and_validation(self):
         resolve = experiment.resolve_gpu_selection
         self.assertEqual(resolve('cuda', [0, 1, 2, 3], 4), ('cuda:0', [0, 1, 2, 3]))
@@ -108,7 +114,9 @@ class IndicatorDataTests(unittest.TestCase):
                 self.assertEqual({int(row['actor']) for row in manifest}, set(config[name+'_actors']))
                 for row in manifest:
                     self.assertEqual(int(Path(row['neutral_video']).stem.split('-')[-1]), int(row['actor']))
-            self.assertEqual(config['test_indicators'], experiment.TEST_INDICATORS)
+            self.assertIsNone(config['test_indicators'])
+            self.assertEqual(config['mlp_input_mode'], 'gradient_gated')
+            self.assertTrue(config['first_layer_gate_assignment']['fixed'])
             self.assertEqual(config['neutral_frame_policy'], 'first')
             with (output/'train_expanded.csv').open() as f:
                 expanded = list(csv.DictReader(f))
@@ -117,7 +125,8 @@ class IndicatorDataTests(unittest.TestCase):
                 expected = experiment.indicators_for_conditions([row['condition']], True)[0]
                 self.assertEqual([int(row['on_v']), int(row['on_a'])], expected)
             for option in (['--head-dim', '0'], ['--lr', 'nan'], ['--mlp-dropout', '1'],
-                           ['--gpu-ids', '0', '0'], ['--device', 'cpu', '--gpu-ids', '1']):
+                           ['--gpu-ids', '0', '0'], ['--device', 'cpu', '--gpu-ids', '1'],
+                           ['--mlp-hidden-dims', '255', '128']):
                 failed = subprocess.run([sys.executable, str(script), '--video-root', str(video), '--audio-root', str(audio),
                                          '--prepare-only', *option], cwd=root, capture_output=True, text=True)
                 self.assertEqual(failed.returncode, 2)
@@ -125,6 +134,75 @@ class IndicatorDataTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Requires PyTorch')
 class IndicatorModelTests(unittest.TestCase):
+    def test_fixed_backward_only_gates_and_adamw_inactive_half_freeze(self):
+        import torch
+        nn = torch.nn
+        class Encoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(1, 3, 1, 384))
+            def forward(self, x):
+                return self.weight.expand(len(x), -1, -1, -1)
+        def backbone(**kwargs):
+            return SimpleNamespace(encoder=Encoder(), encoder_audio=Encoder(),
+                                   video_layer_weights=nn.Parameter(torch.ones(1)), audio_layer_weights=nn.Parameter(torch.ones(1)))
+        args = SimpleNamespace(embed_dim=384, depth=1, drop_path=0., head_dim=8,
+                               mlp_hidden_dims=[12, 7, 9], mlp_dropout=0., mlp_input_mode='gradient_gated')
+        with patch.dict('sys.modules', {'modeling_finetune_av': SimpleNamespace(AudioVisionTransformer=backbone)}):
+            model = experiment.make_model(args)
+            restored = experiment.make_model(args).eval()
+        first = model.classifier[0]
+        self.assertEqual(first.visual.in_features, 16)
+        self.assertEqual(first.visual.out_features, 6)
+        self.assertEqual(first.audio.out_features, 6)
+        self.assertFalse(hasattr(model, 'test_indicators'))
+        self.assertIsNone(model.indicators_for_test_condition('video_noise'))
+        parameter_ids = [id(first.visual.weight), id(first.audio.weight)]
+        video, audio = torch.ones(3, 1), torch.ones(3, 1)
+        bits = torch.tensor([[1., 0.], [0., 1.], [1., 1.]])
+        captures = []
+        def capture(module, inputs, output):
+            output.retain_grad()
+            captures.append(output)
+        handle = model.classifier[1].register_forward_hook(capture)
+        logits = model(video, audio, indicators=bits)
+        hidden = captures[-1]
+        torch.testing.assert_close(logits, model(video, audio, indicators=torch.ones(3, 2)))
+        logits.sum().backward()
+        mask = bits.repeat_interleave(6, dim=-1).bool()
+        self.assertEqual(hidden.grad[~mask].abs().sum().item(), 0)
+        self.assertGreater(hidden.grad[mask].abs().sum().item(), 0)
+        handle.remove()
+        # Populate AdamW momentum before verifying that an inactive group is skipped.
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.01, weight_decay=.2)
+        def step(indicators):
+            optimizer.zero_grad(set_to_none=True)
+            loss = nn.functional.cross_entropy(model(video, audio, indicators=indicators), torch.tensor([0, 1, 2]))
+            loss.backward()
+            model.prepare_gradient_gate_step(indicators)
+            optimizer.step()
+        step(torch.ones(3, 2))
+        for inactive, gate in ((first.visual, [0., 1.]), (first.audio, [1., 0.])):
+            snapshots = {parameter: (parameter.detach().clone(),
+                                     {key: value.clone() if torch.is_tensor(value) else value
+                                      for key, value in optimizer.state[parameter].items()})
+                         for parameter in inactive.parameters()}
+            step(torch.tensor([gate]*3))
+            for parameter, (before, state) in snapshots.items():
+                self.assertIsNone(parameter.grad)
+                torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        torch.testing.assert_close(optimizer.state[parameter][key], value, rtol=0, atol=0)
+                    else:
+                        self.assertEqual(optimizer.state[parameter][key], value)
+            self.assertIsNotNone(model.classifier[-1].weight.grad)
+        self.assertEqual(parameter_ids, [id(first.visual.weight), id(first.audio.weight)])
+        model.eval()
+        torch.testing.assert_close(model(video, audio), model(video, audio, indicators=torch.zeros(3, 2)))
+        restored.load_state_dict(model.state_dict(), strict=True)
+        torch.testing.assert_close(restored(video, audio), model(video, audio))
+
     def test_actual_data_parallel_when_multiple_gpus_available(self):
         import torch
         if torch.cuda.device_count() < 2:
@@ -206,6 +284,12 @@ class IndicatorModelTests(unittest.TestCase):
                      'Requires PyTorch/numpy/sklearn')
 class IndicatorTrainerTests(unittest.TestCase):
     def test_mixed_training_bits_and_forced_test_bits_in_saved_outputs(self):
+        self.check_training_outputs(False)
+
+    def test_gradient_gated_training_and_indicator_free_testing(self):
+        self.check_training_outputs(True)
+
+    def check_training_outputs(self, gated):
         import io
         from contextlib import redirect_stdout
         import torch
@@ -224,15 +308,29 @@ class IndicatorTrainerTests(unittest.TestCase):
         class Model(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.classifier = nn.Linear(14, 6)
+                self.gradient_gating = gated
+                self.classifier = nn.Linear(12 if gated else 14, 6)
+            def prepare_gradient_gate_step(self, indicators):
+                if indicators is None:
+                    raise AssertionError('Training gate missing')
             def forward(self, video, audio, indicators=None, return_terms=False):
-                logits = self.classifier(torch.cat((video, audio, indicators), -1))
+                if gated:
+                    if self.training and indicators is None:
+                        raise AssertionError('Training must supply gates')
+                    if not self.training and indicators is not None:
+                        raise AssertionError('Testing must not supply gates')
+                    features = torch.cat((video, audio), -1)
+                else:
+                    features = torch.cat((video, audio, indicators), -1)
+                logits = self.classifier(features)
                 return (logits, (logits,)) if return_terms else logits
         loaders = {'train': torch.utils.data.DataLoader(Dataset(training=True), batch_size=4, shuffle=True)}
         for condition in experiment.TEST_CONDITIONS:
             loaders['test_'+condition] = torch.utils.data.DataLoader(Dataset(condition), batch_size=4)
         args = SimpleNamespace(seed=42, device='cpu', checkpoint=None, lr=.001, weight_decay=.05, epochs=2,
                                skip_epoch_tests=False, skip_explanations=True)
+        if gated:
+            args.mlp_input_mode, args.test_indicators = 'gradient_gated', None
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             with patch.object(experiment, 'make_model', return_value=Model()), \
@@ -248,7 +346,7 @@ class IndicatorTrainerTests(unittest.TestCase):
             for condition in experiment.TEST_CONDITIONS:
                 with (output/('test_predictions_'+condition+'.csv')).open() as f:
                     rows = list(csv.DictReader(f))
-                expected = tuple(str(bit) for bit in experiment.TEST_INDICATORS[condition])
+                expected = ('', '') if gated else tuple(str(bit) for bit in experiment.TEST_INDICATORS[condition])
                 self.assertEqual({(row['on_v'], row['on_a']) for row in rows}, {expected})
                 for row in rows:
                     self.assertEqual([int(row['available_v']), int(row['available_a'])],
@@ -257,7 +355,7 @@ class IndicatorTrainerTests(unittest.TestCase):
                         self.assertEqual(row['logit_'+emotion], row['mlp_logit_'+emotion])
             summary = json.loads((output/'test_metrics.json').read_text())
             self.assertEqual(summary['architecture'], 'indicator_mlp')
-            self.assertEqual(summary['test_indicators'], experiment.TEST_INDICATORS)
+            self.assertEqual(summary['test_indicators'], None if gated else experiment.TEST_INDICATORS)
             self.assertEqual(summary['initialization'], 'random')
             self.assertTrue((output/'final.pth').exists())
             checkpoint = torch.load(output/'final.pth', map_location='cpu')
