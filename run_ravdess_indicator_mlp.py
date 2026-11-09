@@ -86,6 +86,20 @@ def first_layer_gate_sizes(width, visual=None, audio=None):
     return visual, audio
 
 
+def condition_gate_sizes(av=128, visual=64, audio=64):
+    if any(type(value) is not int or value < 1 for value in (av, visual, audio)):
+        raise ValueError('AV, visual-only and audio-only gated neuron counts must be positive integers')
+    return {'av': av, 'visual': visual, 'audio': audio}
+
+
+def condition_group_gates(indicators):
+    mapping = {(1, 1): [1, 0, 0], (1, 0): [0, 1, 0], (0, 1): [0, 0, 1]}
+    try:
+        return [mapping[tuple(bits)] for bits in indicators]
+    except KeyError as error:
+        raise ValueError('Training indicators must be [1,1], [1,0] or [0,1]') from error
+
+
 def discover(video_root, audio_root):
     """Pair speech MP4s with WAVs using the six non-modality filename fields."""
     audios = {}
@@ -308,7 +322,9 @@ def make_model(args):
 
         def __init__(self):
             super().__init__()
-            self.gradient_gating = getattr(args, 'mlp_input_mode', 'concat_indicators') == 'gradient_gated'
+            mode = getattr(args, 'mlp_input_mode', 'concat_indicators')
+            self.condition_gradient_gating = mode == 'condition_gradient_gated'
+            self.gradient_gating = mode in ('gradient_gated', 'condition_gradient_gated')
             if not self.gradient_gating:
                 # Retain the old architecture only for loading previous runs.
                 self.test_indicators = getattr(args, 'test_indicators', [1, 1])
@@ -328,22 +344,29 @@ def make_model(args):
             self.video_head, self.audio_head = feature_head(), feature_head()
             hidden_dims = list(args.mlp_hidden_dims)
             if self.gradient_gating:
-                self.visual_gated_neurons, self.audio_gated_neurons = first_layer_gate_sizes(
-                    hidden_dims[0], getattr(args, 'visual_gated_neurons', None), getattr(args, 'audio_gated_neurons', None))
-                hidden_dims[0] = self.visual_gated_neurons + self.audio_gated_neurons
+                if self.condition_gradient_gating:
+                    self.gate_group_sizes = condition_gate_sizes(getattr(args, 'av_gated_neurons', 128),
+                        getattr(args, 'visual_gated_neurons', 64), getattr(args, 'audio_gated_neurons', 64))
+                else:
+                    visual, audio = first_layer_gate_sizes(hidden_dims[0], getattr(args, 'visual_gated_neurons', None),
+                                                          getattr(args, 'audio_gated_neurons', None))
+                    self.gate_group_sizes = {'visual': visual, 'audio': audio}
+                self.visual_gated_neurons, self.audio_gated_neurons = self.gate_group_sizes['visual'], self.gate_group_sizes['audio']
+                hidden_dims[0] = sum(self.gate_group_sizes.values())
             layers, width = [], 2 * args.head_dim + (0 if self.gradient_gating else 2)
             for index, hidden in enumerate(hidden_dims):
                 if self.gradient_gating and index == 0:
                     class FixedGroups(nn.Module):
-                        def __init__(self, inputs, visual_width, audio_width):
+                        def __init__(self, inputs, group_sizes):
                             super().__init__()
                             # Separate parameters allow AdamW to skip a wholly
                             # inactive group, including momentum and weight decay.
-                            self.visual = nn.Linear(inputs, visual_width)
-                            self.audio = nn.Linear(inputs, audio_width)
+                            self.order = tuple(group_sizes)
+                            for name, count in group_sizes.items():
+                                setattr(self, name, nn.Linear(inputs, count))
                         def forward(self, features):
-                            return torch.cat((self.visual(features), self.audio(features)), dim=-1)
-                    linear = FixedGroups(width, self.visual_gated_neurons, self.audio_gated_neurons)
+                            return torch.cat([getattr(self, name)(features) for name in self.order], dim=-1)
+                    linear = FixedGroups(width, self.gate_group_sizes)
                 else:
                     linear = nn.Linear(width, hidden)
                 layers.extend([linear, nn.GELU(), nn.Dropout(args.mlp_dropout)])
@@ -356,13 +379,21 @@ def make_model(args):
                 return None
             return indicators_for_conditions([condition], False, self.test_indicators)[0]
 
+        def training_group_gates(self, indicators):
+            if not self.condition_gradient_gating:
+                return indicators
+            if not (indicators.sum(dim=1) >= 1).all():
+                raise ValueError('No training condition corresponds to indicators [0,0]')
+            visual, audio = indicators[:, :1], indicators[:, 1:2]
+            return torch.cat((visual * audio, visual * (1-audio), (1-visual) * audio), dim=1)
+
         def prepare_gradient_gate_step(self, indicators):
             """Use GLOBAL batch eligibility, after DataParallel gradient reduction."""
             if self.gradient_gating:
-                active = indicators.detach().bool().any(dim=0).tolist()
-                for enabled, half in zip(active, (self.classifier[0].visual, self.classifier[0].audio)):
+                active = self.training_group_gates(indicators.detach()).bool().any(dim=0).tolist()
+                for enabled, name in zip(active, self.gate_group_sizes):
                     if not enabled:
-                        for parameter in half.parameters():
+                        for parameter in getattr(self.classifier[0], name).parameters():
                             parameter.grad = None
 
         def forward(self, video, audio, indicators=None, return_terms=False):
@@ -382,8 +413,9 @@ def make_model(args):
             if self.gradient_gating:
                 hidden = self.classifier[1](self.classifier[0](torch.cat((hv, ha), dim=-1)))
                 if self.training:
-                    gate = torch.cat((indicators[:, :1].expand(-1, self.visual_gated_neurons),
-                                      indicators[:, 1:2].expand(-1, self.audio_gated_neurons)), dim=-1)
+                    groups = self.training_group_gates(indicators)
+                    gate = torch.cat([groups[:, i:i+1].expand(-1, count)
+                                      for i, count in enumerate(self.gate_group_sizes.values())], dim=-1)
                     # Identity in the forward pass; only incoming gradients are gated.
                     hidden = hidden.detach() + gate * (hidden - hidden.detach())
                 for layer in list(self.classifier.children())[2:]:
@@ -502,6 +534,9 @@ def train(splits, args, output):
                                   available_v=available[0], available_a=available[1],
                                   on_v=bits[i][0] if bits is not None else '', on_a=bits[i][1] if bits is not None else '',
                                   label=target, prediction=predictions[i], correct=int(target == predictions[i]), loss=loss_values[i])
+                    if getattr(raw_model, 'condition_gradient_gating', False):
+                        record['gradient_gate_group'] = ({'both': 'av', 'video_noise': 'visual', 'audio_neutral': 'audio'}[conditions[i]]
+                                                         if training else '')
                     for j, emotion in enumerate(EMOTIONS):
                         record['p_' + emotion] = probabilities[i][j]
                         record['logit_' + emotion] = record['mlp_logit_' + emotion] = scores[i][j]
@@ -578,10 +613,12 @@ def main():
     parser.add_argument('--depth', type=int, default=10)
     parser.add_argument('--head-dim', type=int, default=256)
     parser.add_argument('--mlp-hidden-dims', nargs='+', type=int, default=[256, 128])
-    parser.add_argument('--visual-gated-neurons', type=int,
-                        help='First-layer visual-gated count; defaults to half, or remainder if only audio count supplied')
-    parser.add_argument('--audio-gated-neurons', type=int,
-                        help='First-layer audio-gated count; both counts supplied override the first hidden width')
+    parser.add_argument('--av-gated-neurons', '--va-gated-neurons', dest='av_gated_neurons', type=int, default=128,
+                        help='First-layer AV-only gradient group size (default 128)')
+    parser.add_argument('--visual-gated-neurons', type=int, default=64,
+                        help='First-layer video-only gradient group size (default 64)')
+    parser.add_argument('--audio-gated-neurons', type=int, default=64,
+                        help='First-layer audio-only gradient group size (default 64)')
     parser.add_argument('--mlp-dropout', type=float, default=.1)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=4)
@@ -603,9 +640,8 @@ def main():
     if min(args.epochs, args.batch_size, args.depth, args.head_dim, *args.mlp_hidden_dims) < 1:
         parser.error('Epochs, batch size, depth and MLP dimensions must be positive')
     try:
-        args.visual_gated_neurons, args.audio_gated_neurons = first_layer_gate_sizes(
-            args.mlp_hidden_dims[0], args.visual_gated_neurons, args.audio_gated_neurons)
-        args.mlp_hidden_dims[0] = args.visual_gated_neurons + args.audio_gated_neurons
+        gate_sizes = condition_gate_sizes(args.av_gated_neurons, args.visual_gated_neurons, args.audio_gated_neurons)
+        args.mlp_hidden_dims[0] = sum(gate_sizes.values())
     except ValueError as error:
         parser.error(str(error))
     if not math.isfinite(args.lr) or args.lr <= 0 or not math.isfinite(args.weight_decay) or args.weight_decay < 0:
@@ -621,11 +657,13 @@ def main():
     args.testing_audio_only_visual = 'neutral'
     args.training_conditions = list(TEST_CONDITIONS)
     args.training_indicators = {'both': [1, 1], 'video_noise': [1, 0], 'audio_neutral': [0, 1]}
-    args.mlp_input_mode = 'gradient_gated'
+    args.mlp_input_mode = 'condition_gradient_gated'
     args.test_indicators = None
-    args.first_layer_gate_assignment = dict(visual=[0, args.visual_gated_neurons],
-                                           audio=[args.visual_gated_neurons, args.mlp_hidden_dims[0]],
-                                           ranges='start_inclusive_end_exclusive', fixed=True)
+    args.first_layer_gate_assignment = dict(av=[0, args.av_gated_neurons],
+        visual=[args.av_gated_neurons, args.av_gated_neurons + args.visual_gated_neurons],
+        audio=[args.av_gated_neurons + args.visual_gated_neurons, args.mlp_hidden_dims[0]],
+        ranges='start_inclusive_end_exclusive', fixed=True)
+    args.training_gate_groups = {'both': 'av', 'video_noise': 'visual', 'audio_neutral': 'audio'}
     args.initialization = 'pretrained_encoders' if args.checkpoint else 'random'
     output = Path(args.output_dir)
     if output.exists() and any(output.iterdir()):
