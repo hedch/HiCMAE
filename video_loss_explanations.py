@@ -87,7 +87,7 @@ class VideoAttentionCapture:
         self.records.clear()
 
 
-def explain_video_loss(model, video, audio, label, indicators=None):
+def explain_video_loss(model, video, audio, label, indicators=None, loss_fn=F.cross_entropy):
     """Explain one trial; return signed layer/tubelet maps plus prediction metadata."""
     if model.training or video.shape[0] != 1:
         raise ValueError('Explanation requires eval mode and a single trial.')
@@ -98,7 +98,7 @@ def explain_video_loss(model, video, audio, label, indicators=None):
         video = video.detach().requires_grad_(True)
         logits = model(video, audio.detach(), **model_kwargs)
         torch.testing.assert_close(logits.detach(), original_logits, rtol=1e-5, atol=1e-6)
-        loss = F.cross_entropy(logits, label)
+        loss = loss_fn(logits, label)
         records = [capture.records[i] for i in sorted(capture.records)]
         # A pure audio head has no computational path through the video encoder.
         gradients = torch.autograd.grad(loss, [r['z'] for r in records]) if records else ()
@@ -137,7 +137,8 @@ def frame_masks(positive, frames, height, width, scale):
     return (masks / max(float(scale), 1e-12)).clamp(0, 1).repeat_interleave(frames // len(masks), dim=0)
 
 
-def export_test_explanations(model, loaders, rows, conditions, device, output, limit=0):
+def export_test_explanations(model, loaders, rows, conditions, device, output, limit=0, *,
+                             loss_fn=F.cross_entropy, target_name="cross entropy"):
     """All conditions share a per-trial positive-relevance scale; save actual inputs."""
     model.eval()
     root = Path(output) / 'explanations'
@@ -154,7 +155,7 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
             bits = model.indicators_for_test_condition(condition) if hasattr(model, 'indicators_for_test_condition') else None
             signed, layers, metadata = explain_video_loss(
                 model, video[None].to(device), audio[None].to(device),
-                torch.tensor([label], device=device), indicators=bits)
+                torch.tensor([label], device=device), indicators=bits, loss_fn=loss_fn)
             results[condition] = (video, signed, layers, metadata)
         scale = max(float(item[1].clamp_min(0).max()) for item in results.values())
         for condition, (video, signed, layers, metadata) in results.items():
@@ -175,7 +176,7 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
                                 normalized=(positive / max(float(positive.max()), 1e-12)).numpy(),
                                 shared_scale_masks=masks.numpy())
             metadata.update(trial=trial, condition=condition, shared_positive_scale=scale,
-                            attribution='pooled-query Grad-ECLIP adaptation; target=cross entropy',
+                            attribution='pooled-query Grad-ECLIP adaptation; target=' + target_name,
                             display='positive loss relevance; shared scale across conditions within trial',
                             overlay='jet-style; alpha=0.45*normalized_relevance; zero leaves image unchanged')
             (destination / 'metadata.json').write_text(json.dumps(metadata, indent=2))
