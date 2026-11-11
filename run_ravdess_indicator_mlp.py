@@ -227,7 +227,7 @@ def gaussian_noise_image(seed, mean=.5, std=.2, size=160):
     return np.repeat(gray[..., None], 3, axis=-1)
 
 
-def make_loaders(splits, args):
+def make_loaders(splits, args, *, assigned_conditions=False):
     import numpy as np
     import torch
     import torchaudio
@@ -259,7 +259,7 @@ def make_loaders(splits, args):
             start = random.uniform(0, duration - span) if self.training else (duration - span) / 2
             times = start + np.arange(16) * span / 16
             indices = np.clip((times * fps).astype(int), 0, len(vr) - 1)
-            if (condition == 'audio_neutral' and self.training
+            if (condition in ('audio_noise', 'audio_neutral') and self.training
                     and getattr(args, 'training_audio_only_visual', 'neutral') == 'gaussian_noise'):
                 visual_seed = row['noise_seed'] + self.epoch * 1000000 + 2000000000
                 image = gaussian_noise_image(visual_seed, getattr(args, 'visual_noise_mean', .5),
@@ -305,7 +305,8 @@ def make_loaders(splits, args):
         return DataLoader(PairedDataset(rows, training, condition), batch_size=args.batch_size,
                           shuffle=training, num_workers=0,
                           pin_memory=args.device.startswith('cuda'), drop_last=False)
-    loaders = dict(train=loader(expand_training_rows(splits['train']), training=True))
+    training_rows = splits['train'] if assigned_conditions else expand_training_rows(splits['train'])
+    loaders = dict(train=loader(training_rows, training=True))
     for condition in TEST_CONDITIONS:
         loaders['test_' + condition] = loader(splits['test'], condition=condition)
     return loaders
