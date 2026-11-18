@@ -3,7 +3,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from run_ravdess_actor_mlp import TEST, data, make_model, trial_losses
+from run_ravdess_actor_mlp import TEST, data, make_model, trial_losses, experiment_units
 
 
 def export_fold(model, loaders, rows, args, folder, limit):
@@ -20,8 +20,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output-dir', required=True, type=Path)
     p.add_argument('--device', default='cuda')
-    p.add_argument('--explain-limit', type=int, default=0, help='Trials per fold; zero means all.')
+    p.add_argument('--explain-limit', type=int, default=0, help='Trials per block; zero means all.')
     p.add_argument('--fold', type=int, nargs='+')
+    p.add_argument('--block', type=int, nargs='+', help='Block IDs to explain; omit for all.')
     options = p.parse_args()
     if options.explain_limit < 0:
         p.error('Use a nonnegative explanation limit.')
@@ -29,8 +30,12 @@ def main():
     folds = options.fold or settings['holdout_groups']
     if not set(folds) <= set(settings['holdout_groups']):
         p.error('A selected fold is absent from the experiment.')
-    for fold in folds:
-        folder = options.output_dir/f'fold_{fold:02d}'
+    blocks = options.block or list(range(1, settings.get('blocks_per_fold', 1)+1))
+    if not set(blocks) <= set(range(1, settings.get('blocks_per_fold', 1)+1)):
+        p.error('A selected block is absent from the experiment.')
+    for fold, block, folder in experiment_units(options.output_dir, settings):
+        if fold not in folds or block not in blocks:
+            continue
         args = argparse.Namespace(**json.loads((folder/'config.json').read_text()))
         args.device = options.device
         splits = {}
@@ -50,3 +55,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
