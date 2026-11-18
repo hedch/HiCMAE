@@ -43,9 +43,40 @@ def allocate(actors, counts, seed):
     return result
 
 
-def prepare(rows, groups, fold, args):
+def experiment_units(root, settings):
+    """Yield every expected model, including legacy one-model-per-fold runs."""
+    root = Path(root)
+    for fold in settings['holdout_groups']:
+        folder = root / f'fold_{fold:02d}'
+        if 'blocks_per_fold' not in settings:
+            yield fold, 1, folder
+        else:
+            for block in range(1, settings['blocks_per_fold'] + 1):
+                yield fold, block, folder / f'block_{block:02d}'
+
+
+def block_assignments(groups, fold, counts, seed, blocks):
+    """Draw distinct gender-balanced assignments reproducibly within a fold."""
+    actors = set(range(1, 25)) - set(groups[fold-1])
+    seen = set()
+    assignments = []
+    for attempt in range(10000):
+        assignment_seed = seed + fold * 10000 + attempt
+        assigned = allocate(actors, counts, assignment_seed)
+        signature = tuple(tuple(assigned[c]) for c in TRAIN)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        assignments.append((assignment_seed, assigned))
+        if len(assignments) == blocks:
+            return assignments
+    raise ValueError('Could not generate the requested distinct actor assignments.')
+
+
+def prepare(rows, groups, fold, args, assigned=None):
     test = groups[fold-1]
-    assigned = allocate(set(range(1, 25))-set(test), args.train_actors, args.seed+fold)
+    if assigned is None:
+        assigned = allocate(set(range(1, 25))-set(test), args.train_actors, args.seed+fold)
     condition = {a: c for c, actors in assigned.items() for a in actors}
     splits = {'train': [], 'test': []}
     # Equalize emotions within each actor, preserving the actor allocation.
@@ -169,11 +200,11 @@ def train_fold(splits, args, folder):
                 metrics = data.classification_metrics(subset)
                 matrix = metrics.pop('confusion_matrix')
                 save_json(epoch_dir/(name+'_confusion.json'), matrix)
-                history.append(dict(fold=args.fold, epoch=epoch, split=name, **metrics))
+                history.append(dict(fold=args.fold, block=getattr(args, 'block', 1), epoch=epoch, split=name, **metrics))
         scheduler.step()
         data.write_csv(folder/'metrics.csv', history)
         av_accuracy = next(r['accuracy'] for r in reversed(history) if r['split'] == 'test_both')
-        print(f'Fold {args.fold}, epoch {epoch}/{args.epochs}, AV test accuracy {av_accuracy:.3f}', flush=True)
+        print(f'Fold {args.fold}, block {args.block}, epoch {epoch}/{args.epochs}, AV test accuracy {av_accuracy:.3f}', flush=True)
     torch.save(raw.state_dict(), folder/'final.pth')
     if not args.skip_explanations:
         from explain_ravdess_actor_mlp import export_fold
@@ -185,7 +216,8 @@ def main():
     for name in ('video-root','audio-root','output-dir'):
         p.add_argument('--'+name, required=True)
     p.add_argument('--train-actors', type=int, nargs=3, metavar=('A_NOISE','V_NOISE','AV'), default=[6,6,8])
-    p.add_argument('--holdout-groups', type=int, nargs='+', default=[1,2,3,4,5], help='Distinct group IDs 1 to 6.')
+    p.add_argument('--holdout-groups', type=int, nargs='+', default=[1,2,3,4,5,6], help='Distinct group IDs 1 to 6.')
+    p.add_argument('--blocks-per-fold', type=int, default=4, help='Fresh models with distinct training actor allocations per fold.')
     p.add_argument('--classification', choices=('six-way','binary'), default='six-way')
     p.add_argument('--mlp-hidden-dims', type=int, nargs='+', default=[256,128])
     p.add_argument('--seed', type=int, default=42)
@@ -209,7 +241,7 @@ def main():
         p.error('Use distinct holdout group IDs between 1 and 6.')
     if sum(args.train_actors)!=20 or min(args.train_actors)<1:
         p.error('The three positive training actor counts must sum to 20.')
-    if min(args.batch_size,args.epochs,args.depth,*args.mlp_hidden_dims)<1 or args.seed<0:
+    if min(args.batch_size,args.epochs,args.depth,args.blocks_per_fold,*args.mlp_hidden_dims)<1 or args.seed<0:
         p.error('Positive dimensions, epochs, batch size and a nonnegative seed are required.')
     args.neutral_frame_policy = 'first'
     args.training_audio_only_visual = 'gaussian_noise'
@@ -220,16 +252,33 @@ def main():
     groups = actor_groups(args.seed)
     root.mkdir(parents=True, exist_ok=True)
     save_json(root/'experiment.json', dict(vars(args), groups=groups, emotions=EMOTIONS))
+    # Prepare every manifest before starting expensive training.
     for fold in args.holdout_groups:
-        config = argparse.Namespace(**vars(args), fold=fold, fold_seed=args.seed+fold)
-        folder = root/f'fold_{fold:02d}'
-        folder.mkdir()
-        splits, actors = prepare(rows, groups, fold, config)
-        save_json(folder/'actors.json', actors)
-        save_json(folder/'config.json', vars(config))
-        for split, records in splits.items():
-            data.write_csv(folder/(split+'.csv'), records)
-        if not args.prepare_only:
+        assignments = block_assignments(groups, fold, args.train_actors, args.seed, args.blocks_per_fold)
+        for block, (assignment_seed, assigned) in enumerate(assignments, start=1):
+            # Same initialization and training RNG seed within a fold isolates
+            # changes in actor allocation. Every block creates a fresh model.
+            config = argparse.Namespace(**vars(args), fold=fold, block=block,
+                                        fold_seed=args.seed+fold, assignment_seed=assignment_seed)
+            folder = root / f'fold_{fold:02d}' / f'block_{block:02d}'
+            folder.mkdir(parents=True)
+            splits, actors = prepare(rows, groups, fold, config, assigned=assigned)
+            save_json(folder/'actors.json', actors)
+            save_json(folder/'config.json', vars(config))
+            for split, records in splits.items():
+                data.write_csv(folder/(split+'.csv'), records)
+    if not args.prepare_only:
+        import csv
+        for fold, block, folder in experiment_units(root, vars(args)):
+            config = argparse.Namespace(**json.loads((folder/'config.json').read_text()))
+            splits = {}
+            for split in ('train', 'test'):
+                with (folder/(split+'.csv')).open(newline='') as stream:
+                    records = list(csv.DictReader(stream))
+                for row in records:
+                    for key in ('actor', 'label', 'noise_seed'):
+                        row[key] = int(row[key])
+                splits[split] = records
             train_fold(splits, config, folder)
     if not args.prepare_only:
         from analyze_ravdess_actor_mlp import analyze
@@ -238,3 +287,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
