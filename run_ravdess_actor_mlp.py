@@ -206,9 +206,6 @@ def train_fold(splits, args, folder):
         av_accuracy = next(r['accuracy'] for r in reversed(history) if r['split'] == 'test_both')
         print(f'Fold {args.fold}, block {args.block}, epoch {epoch}/{args.epochs}, AV test accuracy {av_accuracy:.3f}', flush=True)
     torch.save(raw.state_dict(), folder/'final.pth')
-    if not args.skip_explanations:
-        from explain_ravdess_actor_mlp import export_fold
-        export_fold(raw, loaders, splits['test'], args, folder, 0)
 
 
 def main():
@@ -233,7 +230,7 @@ def main():
     p.add_argument('--noise-rms', type=float, default=.05)
     p.add_argument('--device', default='cuda')
     p.add_argument('--gpu-ids', type=int, nargs='+')
-    p.add_argument('--skip-explanations', action='store_true')
+    p.add_argument('--skip-explanations', action='store_true', help=argparse.SUPPRESS)  # Legacy no-op.
     p.add_argument('--prepare-only', action='store_true')
     args = p.parse_args()
     if (len(set(args.holdout_groups)) != len(args.holdout_groups)
@@ -287,4 +284,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
