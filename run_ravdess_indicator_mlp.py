@@ -305,8 +305,10 @@ def make_loaders(splits, args, *, assigned_conditions=False):
         return DataLoader(PairedDataset(rows, training, condition), batch_size=args.batch_size,
                           shuffle=training, num_workers=0,
                           pin_memory=args.device.startswith('cuda'), drop_last=False)
-    training_rows = splits['train'] if assigned_conditions else expand_training_rows(splits['train'])
-    loaders = dict(train=loader(training_rows, training=True))
+    loaders = {}
+    if 'train' in splits:
+        training_rows = splits['train'] if assigned_conditions else expand_training_rows(splits['train'])
+        loaders['train'] = loader(training_rows, training=True)
     for condition in TEST_CONDITIONS:
         loaders['test_' + condition] = loader(splits['test'], condition=condition)
     return loaders
