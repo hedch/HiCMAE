@@ -53,11 +53,14 @@ def query_relevance(q, k, v, gradient, chunk_size=64):
 
 
 class VideoAttentionCapture:
-    def __init__(self, encoder):
+    def __init__(self, encoder, last_layer_only=False):
+        self.last_layer_only = last_layer_only
         self.encoder, self.records, self.handles = encoder, {}, []
 
     def __enter__(self):
         for index, block in enumerate(self.encoder.blocks):
+            if self.last_layer_only and index != len(self.encoder.blocks) - 1:
+                continue
             attention = block.attn
 
             def capture_qkv(module, inputs, index=index):
@@ -87,14 +90,14 @@ class VideoAttentionCapture:
         self.records.clear()
 
 
-def explain_video_loss(model, video, audio, label, indicators=None, loss_fn=F.cross_entropy):
+def explain_video_loss(model, video, audio, label, indicators=None, loss_fn=F.cross_entropy, *, last_layer_only=False):
     """Explain one trial; return signed layer/tubelet maps plus prediction metadata."""
     if model.training or video.shape[0] != 1:
         raise ValueError('Explanation requires eval mode and a single trial.')
     model_kwargs = {} if indicators is None else dict(indicators=video.new_tensor([indicators]))
     with torch.no_grad():
         original_logits = model(video, audio, **model_kwargs)
-    with torch.enable_grad(), VideoAttentionCapture(model.encoder) as capture:
+    with torch.enable_grad(), VideoAttentionCapture(model.encoder, last_layer_only) as capture:
         video = video.detach().requires_grad_(True)
         logits = model(video, audio.detach(), **model_kwargs)
         torch.testing.assert_close(logits.detach(), original_logits, rtol=1e-5, atol=1e-6)
@@ -121,6 +124,9 @@ def explain_video_loss(model, video, audio, label, indicators=None, loss_fn=F.cr
                             correct=bool(logits.argmax(1).item() == label.item()),
                             logits=logits[0].detach().cpu().tolist(),
                             forward_max_abs_error=(logits.detach()-original_logits).abs().max().item())
+            if last_layer_only:
+                metadata.update(video_block_index=len(model.encoder.blocks) - 1,
+                                video_attention_heads=model.encoder.blocks[-1].attn.num_heads)
             if hasattr(model, 'test_indicators'):
                 bits = indicators if indicators is not None else model.test_indicators
                 if isinstance(bits, dict):
@@ -138,7 +144,7 @@ def frame_masks(positive, frames, height, width, scale):
 
 
 def export_test_explanations(model, loaders, rows, conditions, device, output, limit=0, *,
-                             loss_fn=F.cross_entropy, target_name="cross entropy"):
+                             loss_fn=F.cross_entropy, target_name="cross entropy", last_layer_only=False):
     """All conditions share a per-trial positive-relevance scale; save actual inputs."""
     model.eval()
     root = Path(output) / 'explanations'
@@ -155,7 +161,7 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
             bits = model.indicators_for_test_condition(condition) if hasattr(model, 'indicators_for_test_condition') else None
             signed, layers, metadata = explain_video_loss(
                 model, video[None].to(device), audio[None].to(device),
-                torch.tensor([label], device=device), indicators=bits, loss_fn=loss_fn)
+                torch.tensor([label], device=device), indicators=bits, loss_fn=loss_fn, last_layer_only=last_layer_only)
             results[condition] = (video, signed, layers, metadata)
         scale = max(float(item[1].clamp_min(0).max()) for item in results.values())
         for condition, (video, signed, layers, metadata) in results.items():
