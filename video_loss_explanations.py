@@ -144,8 +144,9 @@ def frame_masks(positive, frames, height, width, scale):
 
 
 def export_test_explanations(model, loaders, rows, conditions, device, output, limit=0, *,
-                             loss_fn=F.cross_entropy, target_name="cross entropy", last_layer_only=False):
-    """All conditions share a per-trial positive-relevance scale; save actual inputs."""
+                             loss_fn=F.cross_entropy, target_name="cross entropy", last_layer_only=False,
+                             save_frame_images=True):
+    """Save heatmap arrays and optionally render overlays on the input frames."""
     model.eval()
     root = Path(output) / 'explanations'
     root.mkdir(parents=True, exist_ok=True)
@@ -169,14 +170,15 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
             destination.mkdir(parents=True, exist_ok=True)
             positive = signed.clamp_min(0)
             masks = frame_masks(positive, video.shape[1], video.shape[2], video.shape[3], scale)
-            mean = video.new_tensor([.485, .456, .406])[:, None, None, None]
-            std = video.new_tensor([.229, .224, .225])[:, None, None, None]
-            images = (video * std + mean).clamp(0, 1).permute(1, 2, 3, 0)
-            masked = (images * masks[..., None] * 255).round().byte().numpy()
-            overlays = color_overlay(images.numpy(), masks.numpy())
-            for frame, image in enumerate(masked):
-                Image.fromarray(image).save(destination / ('frame_%02d_masked.png' % frame))
-                Image.fromarray(overlays[frame]).save(destination / ('frame_%02d_overlay.png' % frame))
+            if save_frame_images:
+                mean = video.new_tensor([.485, .456, .406])[:, None, None, None]
+                std = video.new_tensor([.229, .224, .225])[:, None, None, None]
+                images = (video * std + mean).clamp(0, 1).permute(1, 2, 3, 0)
+                masked = (images * masks[..., None] * 255).round().byte().numpy()
+                overlays = color_overlay(images.numpy(), masks.numpy())
+                for frame, image in enumerate(masked):
+                    Image.fromarray(image).save(destination / ('frame_%02d_masked.png' % frame))
+                    Image.fromarray(overlays[frame]).save(destination / ('frame_%02d_overlay.png' % frame))
             np.savez_compressed(destination / 'heatmaps.npz', signed=signed.numpy(),
                                 signed_layers=layers.numpy(), positive=positive.numpy(),
                                 normalized=(positive / max(float(positive.max()), 1e-12)).numpy(),
@@ -184,7 +186,8 @@ def export_test_explanations(model, loaders, rows, conditions, device, output, l
             metadata.update(trial=trial, condition=condition, shared_positive_scale=scale,
                             attribution='pooled-query Grad-ECLIP adaptation; target=' + target_name,
                             display='positive loss relevance; shared scale across conditions within trial',
-                            overlay='jet-style; alpha=0.45*normalized_relevance; zero leaves image unchanged')
+                            overlay=('jet-style; alpha=0.45*normalized_relevance; zero leaves image unchanged'
+                                     if save_frame_images else None))
             (destination / 'metadata.json').write_text(json.dumps(metadata, indent=2))
             with manifest.open('a') as f:
                 f.write(json.dumps(make_index_record(metadata, index, destination)) + '\n')
@@ -263,3 +266,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
